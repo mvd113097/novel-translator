@@ -43,14 +43,24 @@ SUPABASE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# NEW:
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_API_KEY = os.environ.get(
+    "OPENROUTER_API_KEY"
+)
 
 SITE_PASSWORD = os.environ.get("SITE_PASSWORD")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN"
+)
 
+TELEGRAM_CHAT_ID = os.environ.get(
+    "TELEGRAM_CHAT_ID"
+)
+
+
+# =========================================================
+# CLIENTS
+# =========================================================
 
 supabase = None
 gemini = None
@@ -75,10 +85,10 @@ if GEMINI_API_KEY:
 # MODEL SETTINGS
 # =========================================================
 
-# Primary model
+# Primary translation model
 GEMINI_MODEL = "gemini-3.6-flash"
 
-# Fallback model
+# Fallback translation model
 OPENROUTER_MODEL = (
     "qwen/qwen3-235b-a22b-2507:free"
 )
@@ -97,32 +107,24 @@ current_translation_novel = None
 # BATCH SETTINGS
 # =========================================================
 
-# Maximum Chinese characters sent in one translation request.
+# Smaller batches are intentionally used for reliability.
 #
-# We deliberately do NOT use the full model context window.
+# This prevents:
+# - oversized requests
+# - excessively large responses
+# - marker corruption
+# - incomplete translations
 #
-# Smaller batches are safer because:
-#
-# - translated English can be longer
-# - prompts add tokens
-# - chapter markers add tokens
-# - very large responses are more likely to fail
-#
-# 30,000 Chinese characters is a good starting point.
-#
-# If testing shows the models handle it comfortably, this can
-# later be increased.
-BATCH_MAX_CHARS = 30000
+# 15,000 Chinese characters is a safer starting point.
+
+BATCH_MAX_CHARS = 15000
 
 
-# Delay after successful request.
-BATCH_DELAY = 1
+# Seconds between successful batches
+BATCH_DELAY = 3
 
 
-# =========================================================
-# HTTP SETTINGS
-# =========================================================
-
+# OpenRouter timeout
 OPENROUTER_TIMEOUT = 600
 
 
@@ -133,12 +135,22 @@ OPENROUTER_TIMEOUT = 600
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
-        print("Telegram bot token not configured.")
+
+        print(
+            "Telegram bot token not configured."
+        )
+
         return False
 
+
     if not TELEGRAM_CHAT_ID:
-        print("Telegram chat ID not configured.")
+
+        print(
+            "Telegram chat ID not configured."
+        )
+
         return False
+
 
     try:
 
@@ -148,24 +160,37 @@ def send_telegram(message):
             + "/sendMessage"
         )
 
+
         response = requests.post(
+
             url,
+
             data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message
+                "chat_id":
+                    TELEGRAM_CHAT_ID,
+
+                "text":
+                    message
             },
+
             timeout=15
+
         )
 
+
         if response.ok:
+
             return True
+
 
         print(
             "Telegram error:",
             response.text
         )
 
+
         return False
+
 
     except Exception as error:
 
@@ -303,7 +328,10 @@ Login
 # LOGIN ROUTE
 # =========================================================
 
-@app.route("/login", methods=["GET", "POST"])
+@app.route(
+    "/login",
+    methods=["GET", "POST"]
+)
 def login():
 
     if request.method == "POST":
@@ -312,6 +340,7 @@ def login():
             "password",
             ""
         )
+
 
         if (
             SITE_PASSWORD
@@ -322,10 +351,12 @@ def login():
 
             return redirect("/")
 
+
         return render_template_string(
             LOGIN_HTML,
             error="Incorrect password."
         )
+
 
     return render_template_string(
         LOGIN_HTML,
@@ -352,21 +383,26 @@ def logout():
 def count_words(text):
 
     if not text:
+
         return 0
+
 
     english_words = re.findall(
         r"\b[\w'-]+\b",
         text
     )
 
+
     chinese_chars = re.findall(
         r"[\u4e00-\u9fff]",
         text
     )
 
+
     if chinese_chars:
 
         return len(chinese_chars)
+
 
     return len(english_words)
 
@@ -392,7 +428,9 @@ def contains_chinese(text):
 def is_chapter_heading(text):
 
     if not text:
+
         return False
+
 
     patterns = [
 
@@ -404,6 +442,7 @@ def is_chapter_heading(text):
 
     ]
 
+
     for pattern in patterns:
 
         if re.search(
@@ -413,6 +452,7 @@ def is_chapter_heading(text):
         ):
 
             return True
+
 
     return False
 
@@ -433,8 +473,10 @@ def detect_titles(text, filename):
 
     ]
 
+
     chinese_title = ""
     english_title = ""
+
 
     filename_title = os.path.splitext(
         filename
@@ -444,16 +486,21 @@ def detect_titles(text, filename):
     for line in lines[:15]:
 
         if is_chapter_heading(line):
+
             continue
 
+
         if len(line) > 100:
+
             continue
+
 
         if contains_chinese(line):
 
             chinese_title = line
 
             break
+
 
         english_title = line
 
@@ -495,7 +542,7 @@ def detect_titles(text, filename):
 
 
 # =========================================================
-# TXT
+# TXT EXTRACTION
 # =========================================================
 
 def extract_txt(file_bytes):
@@ -527,7 +574,7 @@ def extract_txt(file_bytes):
 
 
 # =========================================================
-# EPUB
+# EPUB EXTRACTION
 # =========================================================
 
 def extract_epub(file_bytes):
@@ -536,7 +583,9 @@ def extract_epub(file_bytes):
         io.BytesIO(file_bytes)
     )
 
+
     sections = []
+
 
     for item in book.get_items():
 
@@ -547,17 +596,23 @@ def extract_epub(file_bytes):
                 "html.parser"
             )
 
+
             text = soup.get_text(
                 "\n",
                 strip=True
             )
 
+
             if text:
 
-                sections.append(text)
+                sections.append(
+                    text
+                )
 
 
-    return "\n\n".join(sections)
+    return "\n\n".join(
+        sections
+    )
 
 
 # =========================================================
@@ -589,6 +644,7 @@ def split_text_into_chapters(text):
             )
         )
 
+
         if len(found) > len(matches):
 
             matches = found
@@ -613,6 +669,7 @@ def split_text_into_chapters(text):
     for i, match in enumerate(matches):
 
         start = match.start()
+
 
         if i + 1 < len(matches):
 
@@ -648,8 +705,11 @@ def split_text_into_chapters(text):
 
             {
                 "number": i + 1,
+
                 "title": title,
+
                 "text": block
+
             }
 
         )
@@ -667,6 +727,7 @@ def create_translation_batches(chapters):
     batches = []
 
     current_batch = []
+
     current_chars = 0
 
 
@@ -682,6 +743,7 @@ def create_translation_batches(chapters):
 
 
         if not text.strip():
+
             continue
 
 
@@ -701,10 +763,11 @@ def create_translation_batches(chapters):
                 )
 
                 current_batch = []
+
                 current_chars = 0
 
 
-            # A large chapter gets its own request.
+            # Large chapter gets its own request.
             batches.append(
                 [chapter]
             )
@@ -728,12 +791,14 @@ def create_translation_batches(chapters):
             )
 
             current_batch = []
+
             current_chars = 0
 
 
         current_batch.append(
             chapter
         )
+
 
         current_chars += chapter_chars
 
@@ -792,7 +857,9 @@ def is_quota_error(error):
 
         "requests per day",
 
-        "requests per minute"
+        "requests per minute",
+
+        "temporarily unavailable"
 
     ]
 
@@ -866,6 +933,7 @@ def build_translation_prompt(batch):
             f"<<<CHAPTER_{index + 1}_START>>>"
         )
 
+
         end_marker = (
             f"<<<CHAPTER_{index + 1}_END>>>"
         )
@@ -892,7 +960,7 @@ You are a professional Chinese-to-English web-novel translator.
 
 Translate EVERY chapter below into natural, fluent English.
 
-This is a literary translation, not a summary.
+This is a literary translation, NOT a summary.
 
 IMPORTANT RULES:
 
@@ -919,6 +987,8 @@ IMPORTANT RULES:
 21. Do not shorten the story.
 22. Internal thoughts enclosed in [ ] should remain clearly recognizable as thoughts.
 23. Keep the same paragraph structure whenever practical.
+24. Do not put markdown headings around the translation.
+25. Do not add a preface or conclusion.
 
 The markers are used by the program to separate the chapters after translation.
 
@@ -944,6 +1014,211 @@ TEXT TO TRANSLATE:
 
 
 # =========================================================
+# GEMINI TEXT EXTRACTION
+# =========================================================
+
+def extract_gemini_text(response):
+
+    # -----------------------------------------------------
+    # Method 1: standard SDK .text
+    # -----------------------------------------------------
+
+    try:
+
+        text = getattr(
+            response,
+            "text",
+            None
+        )
+
+
+        if text:
+
+            return str(
+                text
+            ).strip()
+
+    except Exception as error:
+
+        print(
+            "Gemini .text extraction failed:",
+            repr(error)
+        )
+
+
+    # -----------------------------------------------------
+    # Method 2: inspect candidates
+    # -----------------------------------------------------
+
+    try:
+
+        candidates = getattr(
+            response,
+            "candidates",
+            None
+        )
+
+
+        if candidates:
+
+            collected = []
+
+
+            for candidate in candidates:
+
+                content = getattr(
+                    candidate,
+                    "content",
+                    None
+                )
+
+
+                if not content:
+
+                    continue
+
+
+                parts = getattr(
+                    content,
+                    "parts",
+                    None
+                )
+
+
+                if not parts:
+
+                    continue
+
+
+                for part in parts:
+
+                    try:
+
+                        part_text = getattr(
+                            part,
+                            "text",
+                            None
+                        )
+
+
+                        if part_text:
+
+                            collected.append(
+                                str(
+                                    part_text
+                                )
+                            )
+
+                    except Exception as part_error:
+
+                        print(
+                            "Gemini part extraction error:",
+                            repr(part_error)
+                        )
+
+
+            if collected:
+
+                result = "\n".join(
+                    collected
+                ).strip()
+
+
+                if result:
+
+                    return result
+
+    except Exception as error:
+
+        print(
+            "Gemini candidate extraction failed:",
+            repr(error)
+        )
+
+
+    # -----------------------------------------------------
+    # Method 3: inspect response dictionary
+    # -----------------------------------------------------
+
+    try:
+
+        if hasattr(
+            response,
+            "model_dump"
+        ):
+
+            data = response.model_dump()
+
+
+            candidates = data.get(
+                "candidates",
+                []
+            )
+
+
+            collected = []
+
+
+            for candidate in candidates:
+
+                content = candidate.get(
+                    "content",
+                    {}
+                )
+
+
+                parts = content.get(
+                    "parts",
+                    []
+                )
+
+
+                for part in parts:
+
+                    if isinstance(
+                        part,
+                        dict
+                    ):
+
+                        part_text = part.get(
+                            "text"
+                        )
+
+
+                        if part_text:
+
+                            collected.append(
+                                str(
+                                    part_text
+                                )
+                            )
+
+
+            if collected:
+
+                result = "\n".join(
+                    collected
+                ).strip()
+
+
+                if result:
+
+                    return result
+
+    except Exception as error:
+
+        print(
+            "Gemini dictionary extraction failed:",
+            repr(error)
+        )
+
+
+    raise RuntimeError(
+        "Gemini returned no usable text."
+    )
+
+
+# =========================================================
 # GEMINI TRANSLATION
 # =========================================================
 
@@ -962,23 +1237,50 @@ def translate_with_gemini(prompt):
     )
 
 
-    interaction = gemini.interactions.create(
-        model=GEMINI_MODEL,
-        input=prompt
-    )
+    try:
 
+        # -------------------------------------------------
+        # Use standard generate_content API.
+        #
+        # This avoids the previous Interactions API
+        # response problem that produced:
+        #
+        # TRANSLATION ERROR: 'text'
+        # -------------------------------------------------
 
-    result = interaction.output_text
+        response = gemini.models.generate_content(
 
+            model=GEMINI_MODEL,
 
-    if not result:
+            contents=prompt
 
-        raise RuntimeError(
-            "Gemini returned an empty translation."
         )
 
 
-    return result.strip()
+        result = extract_gemini_text(
+            response
+        )
+
+
+        if not result:
+
+            raise RuntimeError(
+                "Gemini returned an empty translation."
+            )
+
+
+        return result.strip()
+
+
+    except Exception as error:
+
+        print(
+            "Gemini request/extraction error:",
+            repr(error)
+        )
+
+
+        raise
 
 
 # =========================================================
@@ -1005,6 +1307,7 @@ def translate_with_openrouter(prompt):
         "https://openrouter.ai/api/v1/chat/completions",
 
         headers={
+
             "Authorization":
                 "Bearer "
                 + OPENROUTER_API_KEY,
@@ -1015,11 +1318,12 @@ def translate_with_openrouter(prompt):
             "HTTP-Referer":
                 os.environ.get(
                     "APP_URL",
-                    "https://localhost"
+                    "https://novel-translator-i8wp.onrender.com"
                 ),
 
             "X-Title":
                 "Novel Translator"
+
         },
 
         json={
@@ -1043,7 +1347,10 @@ def translate_with_openrouter(prompt):
                 0.2,
 
             "max_tokens":
-                65536
+                50000,
+
+            "stream":
+                False
 
         },
 
@@ -1052,84 +1359,177 @@ def translate_with_openrouter(prompt):
     )
 
 
+    print(
+        "OpenRouter HTTP status:",
+        response.status_code
+    )
+
+
+    # -----------------------------------------------------
+    # HTTP ERROR
+    # -----------------------------------------------------
+
     if response.status_code != 200:
 
         raise RuntimeError(
+
             "OpenRouter HTTP "
             + str(response.status_code)
             + ": "
             + response.text[:3000]
+
         )
 
+
+    # -----------------------------------------------------
+    # JSON
+    # -----------------------------------------------------
 
     try:
 
         data = response.json()
 
-    except Exception:
+    except Exception as error:
 
         raise RuntimeError(
-            "OpenRouter returned invalid JSON."
+
+            "OpenRouter returned invalid JSON: "
+            + str(error)
+
         )
 
 
+    # -----------------------------------------------------
+    # API LEVEL ERROR
+    # -----------------------------------------------------
+
+    if data.get("error"):
+
+        raise RuntimeError(
+
+            "OpenRouter API error: "
+            + str(
+                data.get("error")
+            )
+
+        )
+
+
+    # -----------------------------------------------------
+    # CHOICES
+    # -----------------------------------------------------
+
     choices = data.get(
-        "choices",
-        []
+        "choices"
     )
 
 
     if not choices:
 
         raise RuntimeError(
-            "OpenRouter returned no choices."
+
+            "OpenRouter returned no choices. "
+            + str(data)[:3000]
+
         )
 
 
     message = choices[0].get(
-        "message",
-        {}
+        "message"
     )
+
+
+    if not message:
+
+        raise RuntimeError(
+            "OpenRouter response contained no message."
+        )
 
 
     result = message.get(
-        "content",
-        ""
+        "content"
     )
 
 
+    # -----------------------------------------------------
+    # NORMAL STRING RESPONSE
+    # -----------------------------------------------------
+
     if isinstance(
+        result,
+        str
+    ):
+
+        result = result.strip()
+
+
+    # -----------------------------------------------------
+    # CONTENT BLOCK RESPONSE
+    # -----------------------------------------------------
+
+    elif isinstance(
         result,
         list
     ):
 
-        result = "".join(
+        parts = []
 
-            part.get(
-                "text",
-                ""
-            )
+
+        for part in result:
 
             if isinstance(
                 part,
                 dict
-            )
+            ):
 
-            else str(part)
+                text = part.get(
+                    "text"
+                )
 
-            for part in result
 
-        )
+                if text:
 
+                    parts.append(
+                        str(text)
+                    )
+
+
+            elif isinstance(
+                part,
+                str
+            ):
+
+                parts.append(
+                    part
+                )
+
+
+        result = "".join(
+            parts
+        ).strip()
+
+
+    else:
+
+        result = ""
+
+
+    # -----------------------------------------------------
+    # EMPTY RESPONSE
+    # -----------------------------------------------------
 
     if not result:
 
         raise RuntimeError(
-            "OpenRouter returned an empty translation."
+
+            "OpenRouter returned an empty translation. "
+            + "Full response: "
+            + str(data)[:5000]
+
         )
 
 
-    return result.strip()
+    return result
 
 
 # =========================================================
@@ -1144,7 +1544,7 @@ def translate_batch(batch):
 
 
     # =====================================================
-    # TRY GEMINI FIRST
+    # GEMINI FIRST
     # =====================================================
 
     if gemini:
@@ -1155,42 +1555,39 @@ def translate_batch(batch):
                 prompt
             )
 
+
             return result, "Gemini"
 
 
         except Exception as gemini_error:
 
-            print(
-                "Gemini error:",
-                error_text(
-                    gemini_error
-                )
+            gemini_message = error_text(
+                gemini_error
             )
 
 
-            # ---------------------------------------------
-            # ONLY FALL BACK TO QWEN FOR QUOTA / RATE LIMIT
-            # ---------------------------------------------
+            print(
+                "Gemini failed:",
+                gemini_message
+            )
 
-            if not is_quota_error(
-                gemini_error
-            ):
 
-                # A normal Gemini error should still try
-                # Qwen once, because Qwen can potentially
-                # complete the request successfully.
-                print(
-                    "Gemini failed for a non-quota reason."
-                )
-
-            else:
-
-                print(
-                    "Gemini quota/rate limit detected."
-                )
-
+            # -------------------------------------------------
+            # TRY QWEN FOR ANY GEMINI ERROR
+            #
+            # This is intentional.
+            #
+            # If Gemini has a malformed response, temporary
+            # API problem, quota problem, etc., Qwen gets a
+            # chance to complete the batch.
+            # -------------------------------------------------
 
             if OPENROUTER_API_KEY:
+
+                print(
+                    "Trying Qwen fallback..."
+                )
+
 
                 try:
 
@@ -1198,37 +1595,39 @@ def translate_batch(batch):
                         prompt
                     )
 
+
                     return result, "Qwen"
 
 
                 except Exception as qwen_error:
 
-                    print(
-                        "Qwen error:",
-                        error_text(
-                            qwen_error
-                        )
+                    qwen_message = error_text(
+                        qwen_error
                     )
+
+
+                    print(
+                        "Qwen failed:",
+                        qwen_message
+                    )
+
 
                     raise RuntimeError(
 
                         "Gemini failed:\n"
-                        + error_text(
-                            gemini_error
-                        )
+                        + gemini_message
                         + "\n\n"
                         + "Qwen failed:\n"
-                        + error_text(
-                            qwen_error
-                        )
+                        + qwen_message
 
                     )
+
 
             raise
 
 
     # =====================================================
-    # NO GEMINI → USE QWEN
+    # NO GEMINI → QWEN
     # =====================================================
 
     if OPENROUTER_API_KEY:
@@ -1236,6 +1635,7 @@ def translate_batch(batch):
         result = translate_with_openrouter(
             prompt
         )
+
 
         return result, "Qwen"
 
@@ -1266,6 +1666,7 @@ def parse_batch_translation(
             f"<<<CHAPTER_{number}_START>>>"
         )
 
+
         end_marker = (
             f"<<<CHAPTER_{number}_END>>>"
         )
@@ -1279,28 +1680,37 @@ def parse_batch_translation(
         if start_position == -1:
 
             raise RuntimeError(
+
                 "Translation did not contain expected "
                 + f"start marker for chapter {number}."
+
             )
 
 
         content_start = (
+
             start_position
             + len(start_marker)
+
         )
 
 
         end_position = translated_text.find(
+
             end_marker,
+
             content_start
+
         )
 
 
         if end_position == -1:
 
             raise RuntimeError(
+
                 "Translation did not contain expected "
                 + f"end marker for chapter {number}."
+
             )
 
 
@@ -1312,8 +1722,10 @@ def parse_batch_translation(
         if not content:
 
             raise RuntimeError(
+
                 "Empty translation for chapter "
                 + str(number)
+
             )
 
 
@@ -1325,8 +1737,10 @@ def parse_batch_translation(
     if len(translations) != len(batch):
 
         raise RuntimeError(
+
             "Translated chapter count does not "
             "match batch chapter count."
+
         )
 
 
@@ -1393,6 +1807,10 @@ def translation_worker(novel_id):
     global current_translation_novel
 
 
+    # -----------------------------------------------------
+    # Only one translation at a time
+    # -----------------------------------------------------
+
     if not translation_lock.acquire(
         blocking=False
     ):
@@ -1415,7 +1833,7 @@ def translation_worker(novel_id):
 
 
         # -------------------------------------------------
-        # COUNT ALREADY COMPLETED CHAPTERS
+        # COUNT ALREADY COMPLETED WORDS
         # -------------------------------------------------
 
         translated_words = 0
@@ -1524,6 +1942,7 @@ def translation_worker(novel_id):
                 .execute()
             )
 
+
             return
 
 
@@ -1541,6 +1960,7 @@ def translation_worker(novel_id):
             len(remaining)
         )
 
+
         print(
             "Translation batches:",
             len(batches)
@@ -1555,7 +1975,6 @@ def translation_worker(novel_id):
             batches,
             start=1
         ):
-
 
             batch_chapters = len(
                 batch
@@ -1578,10 +1997,12 @@ def translation_worker(novel_id):
 
 
             print(
+
                 f"Starting batch {batch_number}/"
                 f"{len(batches)}"
                 f" - {batch_chapters} chapters"
                 f" - {batch_chars:,} Chinese characters"
+
             )
 
 
@@ -1609,24 +2030,24 @@ def translation_worker(novel_id):
                 # -------------------------------------------------
 
                 translations = parse_batch_translation(
+
                     translated_batch,
+
                     batch
+
                 )
 
 
                 # -------------------------------------------------
-                # IMPORTANT:
-                #
-                # We only start saving AFTER the entire batch
-                # has successfully returned AND parsed.
-                #
-                # Therefore a malformed/partial response does
-                # not mark chapters as translated.
+                # SAVE ONLY AFTER WHOLE BATCH PARSES
                 # -------------------------------------------------
 
                 for chapter, translated in zip(
+
                     batch,
+
                     translations
+
                 ):
 
                     words = count_words(
@@ -1685,28 +2106,43 @@ def translation_worker(novel_id):
 
 
                     print(
+
                         "Completed chapter",
+
                         chapter["chapter_number"],
+
                         "-",
+
                         words,
+
                         "translated words",
+
                         "- model:",
+
                         model_used
+
                     )
 
 
                 print(
+
                     f"Completed batch {batch_number}/"
                     f"{len(batches)}"
                     f" using {model_used}"
+
                 )
 
 
                 del translated_batch
+
                 del translations
 
                 gc.collect()
 
+
+                # -------------------------------------------------
+                # Delay before next request
+                # -------------------------------------------------
 
                 time.sleep(
                     BATCH_DELAY
@@ -1727,7 +2163,7 @@ def translation_worker(novel_id):
 
 
                 # =================================================
-                # QUOTA / RATE LIMIT
+                # QUOTA / RATE LIMIT / TEMPORARY RESOURCE ERROR
                 # =================================================
 
                 if is_quota_error(error):
@@ -1767,8 +2203,8 @@ def translation_worker(novel_id):
 
                         "⏸️ TRANSLATION PAUSED\n\n"
 
-                        "Both available translation paths "
-                        "are currently rate-limited or unavailable.\n\n"
+                        "The translation API is currently "
+                        "rate-limited or temporarily unavailable.\n\n"
 
                         "Completed chapters were saved safely.\n\n"
 
@@ -2056,12 +2492,15 @@ def get_chinese_title(novel):
 # DOWNLOAD TXT
 # =========================================================
 
-@app.route("/download/txt/<novel_id>")
+@app.route(
+    "/download/txt/<novel_id>"
+)
 def download_txt(novel_id):
 
     protection = login_required()
 
     if protection:
+
         return protection
 
 
@@ -2093,8 +2532,10 @@ def download_txt(novel_id):
     ):
 
         return (
+
             "There are no completely translated chapters "
             "available for download yet."
+
         ), 403
 
 
@@ -2124,6 +2565,7 @@ def download_txt(novel_id):
         "English Title: "
         + novel["title"]
     )
+
 
     output.append("")
 
@@ -2187,10 +2629,15 @@ def download_txt(novel_id):
 
 
     return send_file(
+
         data,
+
         mimetype="text/plain",
+
         as_attachment=True,
+
         download_name=filename
+
     )
 
 
@@ -2198,12 +2645,15 @@ def download_txt(novel_id):
 # DOWNLOAD EPUB
 # =========================================================
 
-@app.route("/download/epub/<novel_id>")
+@app.route(
+    "/download/epub/<novel_id>"
+)
 def download_epub(novel_id):
 
     protection = login_required()
 
     if protection:
+
         return protection
 
 
@@ -2235,8 +2685,10 @@ def download_epub(novel_id):
     ):
 
         return (
+
             "There are no completely translated chapters "
             "available for download yet."
+
         ), 403
 
 
@@ -2276,9 +2728,13 @@ def download_epub(novel_id):
     # =====================================================
 
     title_page = epub.EpubHtml(
+
         title="Title",
+
         file_name="title.xhtml",
+
         lang="en"
+
     )
 
 
@@ -2303,9 +2759,11 @@ def download_epub(novel_id):
 
 
         title_html += (
+
             "<h1>"
             + safe_chinese
             + "</h1>"
+
         )
 
 
@@ -2320,9 +2778,11 @@ def download_epub(novel_id):
 
 
     title_html += (
+
         "<h2>English Title: "
         + safe_english
         + "</h2>"
+
     )
 
 
@@ -2395,11 +2855,15 @@ def download_epub(novel_id):
 
 
         c = epub.EpubHtml(
+
             title=title,
+
             file_name=(
                 f"chapter_{chapter_number}.xhtml"
             ),
+
             lang="en"
+
         )
 
 
@@ -2417,6 +2881,7 @@ def download_epub(novel_id):
 
 
             if not paragraph:
+
                 continue
 
 
@@ -2431,9 +2896,11 @@ def download_epub(novel_id):
 
 
             html += (
+
                 "<p>"
                 + safe_paragraph
                 + "</p>"
+
             )
 
 
@@ -2504,10 +2971,15 @@ def download_epub(novel_id):
 
 
     return send_file(
+
         output,
+
         mimetype="application/epub+zip",
+
         as_attachment=True,
+
         download_name=filename
+
     )
 
 
@@ -2524,6 +2996,7 @@ def delete_novel(novel_id):
     protection = login_required()
 
     if protection:
+
         return protection
 
 
@@ -2924,13 +3397,13 @@ Press Resume Translation to continue.
 
 Gemini is used first.
 
-If Gemini reaches a quota/rate limit,
+If Gemini fails for any reason,
 the app automatically tries Qwen through OpenRouter.
 
 <br><br>
 
-Multiple small chapters are combined into larger
-requests to reduce the number of API requests.
+Requests use smaller batches of approximately
+15,000 Chinese characters for better reliability.
 
 <br><br>
 
@@ -2950,11 +3423,19 @@ the remaining chapters continue translating.
 
 <div class="model">
 
-Primary: Gemini
+Primary: Gemini 3.6 Flash
 
 <br>
 
 Fallback: Qwen3 235B A22B Instruct 2507
+
+<br>
+
+Batch size: 15,000 Chinese characters
+
+<br>
+
+Delay: 3 seconds
 
 </div>
 
@@ -3099,10 +3580,12 @@ def home():
     protection = login_required()
 
     if protection:
+
         return protection
 
 
     novel = None
+
     message = None
 
 
@@ -3177,13 +3660,17 @@ def home():
                 if (
                     chapter.get("status")
                     == "translated"
-                    and (
+
+                    and
+
+                    (
                         chapter.get(
                             "translated_text",
                             ""
                         )
                         or ""
                     ).strip()
+
                 ):
 
                     has_completed_chapters = True
@@ -3231,6 +3718,7 @@ def upload():
     protection = login_required()
 
     if protection:
+
         return protection
 
 
@@ -3298,11 +3786,13 @@ def upload():
                 file_bytes
             )
 
+
         elif filename.lower().endswith(".epub"):
 
             text = extract_epub(
                 file_bytes
             )
+
 
         else:
 
@@ -3319,8 +3809,11 @@ def upload():
 
 
         chinese_title, english_title = detect_titles(
+
             text,
+
             filename
+
         )
 
 
@@ -3328,9 +3821,11 @@ def upload():
 
             title = english_title
 
+
         elif chinese_title:
 
             title = chinese_title
+
 
         else:
 
@@ -3424,6 +3919,7 @@ def upload():
 
 
         del file_bytes
+
         del text
 
         gc.collect()
@@ -3432,13 +3928,25 @@ def upload():
         send_telegram(
 
             "📚 NOVEL UPLOADED\n\n"
+
             + title
+
             + "\n\n"
+
             + "Original words: "
+
             + f"{total_words:,}"
+
             + "\n\n"
+
             + "Gemini → Qwen fallback enabled."
+
             + "\n\n"
+
+            + "Batch size: 15,000 Chinese characters."
+
+            + "\n\n"
+
             + "Press Start Translation on the website."
 
         )
@@ -3481,6 +3989,7 @@ def start_translation(novel_id):
     protection = login_required()
 
     if protection:
+
         return protection
 
 
@@ -3530,6 +4039,10 @@ def start_translation(novel_id):
             return redirect("/")
 
 
+        # -------------------------------------------------
+        # Prevent starting another translation
+        # -------------------------------------------------
+
         if translation_lock.locked():
 
             return redirect("/")
@@ -3555,8 +4068,11 @@ def start_translation(novel_id):
     except Exception as error:
 
         return (
+
             "Unable to start translation: "
+
             + str(error)
+
         )
 
 
@@ -3577,14 +4093,19 @@ def health():
 if __name__ == "__main__":
 
     port = int(
+
         os.environ.get(
             "PORT",
             5000
         )
+
     )
 
 
     app.run(
+
         host="0.0.0.0",
+
         port=port
+
     )
