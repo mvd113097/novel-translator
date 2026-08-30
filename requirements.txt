@@ -1,0 +1,5 @@
+flask
+supabase
+google-genai
+ebooklib
+beautifulsoup4
