@@ -4,3 +4,4 @@ supabase
 google-genai
 ebooklib
 beautifulsoup4
+requests
