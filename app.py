@@ -6,10 +6,20 @@ import time
 import gc
 import secrets
 import requests
-import html
-from flask import Flask, request, render_template_string, redirect, send_file, session
+from html import escape
+
+from flask import (
+    Flask,
+    request,
+    render_template_string,
+    redirect,
+    send_file,
+    session
+)
+
 from supabase import create_client
 from google import genai
+
 from ebooklib import epub
 from bs4 import BeautifulSoup
 
@@ -31,29 +41,49 @@ app.secret_key = os.environ.get(
 # =========================================================
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY")
+
+SUPABASE_KEY = os.environ.get(
+    "SUPABASE_PUBLISHABLE_KEY"
+)
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
 SITE_PASSWORD = os.environ.get("SITE_PASSWORD")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN"
+)
 
+TELEGRAM_CHAT_ID = os.environ.get(
+    "TELEGRAM_CHAT_ID"
+)
+
+
+# =========================================================
+# CLIENTS
+# =========================================================
 
 supabase = None
 gemini = None
 
 
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(
-        SUPABASE_URL,
-        SUPABASE_KEY
-    )
+    try:
+        supabase = create_client(
+            SUPABASE_URL,
+            SUPABASE_KEY
+        )
+    except Exception as error:
+        print("Supabase initialization error:", error)
 
 
 if GEMINI_API_KEY:
-    gemini = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
+    try:
+        gemini = genai.Client(
+            api_key=GEMINI_API_KEY
+        )
+    except Exception as error:
+        print("Gemini initialization error:", error)
 
 
 # =========================================================
@@ -66,14 +96,12 @@ current_translation_novel = None
 
 last_translation_activity = 0
 
-# 2 minutes
+# Translation is considered stopped if there has been
+# no activity for 2 minutes.
 STOP_TIMEOUT = 2 * 60
 
-# How many times Gemini should retry a temporary error
-MAX_RETRIES = 5
-
-# Wait time between retries
-RETRY_DELAY = 10
+# Prevent duplicate Telegram alerts.
+last_stop_alert_novel = None
 
 
 # =========================================================
@@ -128,7 +156,7 @@ def send_telegram(message):
 
 
 # =========================================================
-# PASSWORD
+# LOGIN
 # =========================================================
 
 def is_logged_in():
@@ -157,16 +185,23 @@ def login_required():
 
 def count_words(text):
 
+    if not text:
+        return 0
+
+    # English-style words.
     english_words = re.findall(
         r"\b[\w'-]+\b",
-        text
+        text,
+        flags=re.UNICODE
     )
 
+    # Chinese characters.
     chinese_chars = re.findall(
         r"[\u4e00-\u9fff]",
         text
     )
 
+    # Use whichever counting method is appropriate.
     if english_words:
         return len(english_words)
 
@@ -174,7 +209,7 @@ def count_words(text):
 
 
 # =========================================================
-# CHINESE
+# CHINESE DETECTION
 # =========================================================
 
 def contains_chinese(text):
@@ -187,15 +222,23 @@ def contains_chinese(text):
     )
 
 
+# =========================================================
+# CHAPTER HEADING
+# =========================================================
+
 def is_chapter_heading(text):
 
     if not text:
         return False
 
     patterns = [
+
         r"^第\s*\d+\s*[章节卷回]",
+
         r"^chapter\s+\d+",
+
         r"^chap\.\s*\d+"
+
     ]
 
     for pattern in patterns:
@@ -217,18 +260,25 @@ def is_chapter_heading(text):
 def detect_titles(text, filename):
 
     lines = [
+
         line.strip()
+
         for line in text.splitlines()
+
         if line.strip()
+
     ]
 
     chinese_title = ""
+
     english_title = ""
 
     filename_title = os.path.splitext(
         filename
     )[0].strip()
 
+
+    # Look at the first 15 meaningful lines.
     for line in lines[:15]:
 
         if is_chapter_heading(line):
@@ -247,6 +297,8 @@ def detect_titles(text, filename):
 
         break
 
+
+    # If no title was found, use filename.
     if not chinese_title and not english_title:
 
         if contains_chinese(filename_title):
@@ -257,6 +309,8 @@ def detect_titles(text, filename):
 
             english_title = filename_title
 
+
+    # Chinese filename can be Chinese title.
     if (
         not chinese_title
         and contains_chinese(filename_title)
@@ -264,6 +318,9 @@ def detect_titles(text, filename):
 
         chinese_title = filename_title
 
+
+    # If Chinese title exists and filename is English,
+    # use filename as English title.
     if (
         chinese_title
         and not english_title
@@ -272,6 +329,7 @@ def detect_titles(text, filename):
 
         english_title = filename_title
 
+
     return (
         chinese_title,
         english_title
@@ -279,7 +337,7 @@ def detect_titles(text, filename):
 
 
 # =========================================================
-# TXT
+# TXT EXTRACTION
 # =========================================================
 
 def extract_txt(file_bytes):
@@ -301,6 +359,7 @@ def extract_txt(file_bytes):
 
             pass
 
+
     return file_bytes.decode(
         "utf-8",
         errors="ignore"
@@ -308,7 +367,7 @@ def extract_txt(file_bytes):
 
 
 # =========================================================
-# EPUB
+# EPUB EXTRACTION
 # =========================================================
 
 def extract_epub(file_bytes):
@@ -321,6 +380,7 @@ def extract_epub(file_bytes):
 
     for item in book.get_items():
 
+        # EbookLib ITEM_DOCUMENT = 9.
         if item.get_type() == 9:
 
             soup = BeautifulSoup(
@@ -334,8 +394,8 @@ def extract_epub(file_bytes):
             )
 
             if text:
-
                 sections.append(text)
+
 
     return "\n\n".join(
         sections
@@ -349,12 +409,18 @@ def extract_epub(file_bytes):
 def split_text_into_chapters(text):
 
     patterns = [
+
         r"(?im)^(第\s*\d+\s*[章节卷回].*)$",
+
         r"(?im)^(chapter\s+\d+.*)$",
+
         r"(?im)^(chap\.\s*\d+.*)$"
+
     ]
 
+
     matches = []
+
 
     for pattern in patterns:
 
@@ -369,6 +435,9 @@ def split_text_into_chapters(text):
 
             matches = found
 
+
+    # If no chapter headings exist,
+    # treat the entire file as one chapter.
     if not matches:
 
         return [
@@ -379,11 +448,14 @@ def split_text_into_chapters(text):
             }
         ]
 
+
     chapters = []
+
 
     for i, match in enumerate(matches):
 
         start = match.start()
+
 
         if i + 1 < len(matches):
 
@@ -395,11 +467,14 @@ def split_text_into_chapters(text):
 
             end = len(text)
 
+
         block = text[
             start:end
         ].strip()
 
+
         lines = block.splitlines()
+
 
         if lines:
 
@@ -411,6 +486,7 @@ def split_text_into_chapters(text):
                 f"Chapter {i + 1}"
             )
 
+
         chapters.append(
             {
                 "number": i + 1,
@@ -418,6 +494,7 @@ def split_text_into_chapters(text):
                 "text": block
             }
         )
+
 
     return chapters
 
@@ -435,6 +512,10 @@ def translate_text(text):
         raise RuntimeError(
             "Gemini API key is not configured."
         )
+
+
+    last_translation_activity = time.time()
+
 
     prompt = f"""
 You are a professional Chinese-to-English web-novel translator.
@@ -461,54 +542,30 @@ TEXT:
 {text}
 """
 
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1
-    ):
 
-        try:
+    interaction = gemini.interactions.create(
 
-            last_translation_activity = time.time()
+        model="gemini-3.6-flash",
 
-            interaction = gemini.interactions.create(
+        input=prompt
 
-                model="gemini-3.6-flash",
+    )
 
-                input=prompt
 
-            )
+    last_translation_activity = time.time()
 
-            last_translation_activity = time.time()
 
-            result = interaction.output_text
+    result = interaction.output_text
 
-            if not result:
 
-                raise RuntimeError(
-                    "Gemini returned an empty translation."
-                )
+    if not result:
 
-            return result.strip()
+        raise RuntimeError(
+            "Gemini returned an empty translation."
+        )
 
-        except Exception as error:
 
-            print(
-                f"Gemini attempt {attempt}/{MAX_RETRIES} failed:",
-                str(error)
-            )
-
-            if attempt >= MAX_RETRIES:
-
-                raise
-
-            # Keep heartbeat alive while retrying.
-            last_translation_activity = time.time()
-
-            time.sleep(
-                RETRY_DELAY
-            )
-
-            last_translation_activity = time.time()
+    return result.strip()
 
 
 # =========================================================
@@ -518,20 +575,29 @@ TEXT:
 def get_latest_novel():
 
     result = (
+
         supabase
+
         .table("novels")
+
         .select("*")
+
         .order(
             "created_at",
             desc=True
         )
+
         .limit(1)
+
         .execute()
+
     )
+
 
     if result.data:
 
         return result.data[0]
+
 
     return None
 
@@ -539,68 +605,28 @@ def get_latest_novel():
 def get_chapters(novel_id):
 
     result = (
+
         supabase
+
         .table("chapters")
+
         .select("*")
+
         .eq(
             "novel_id",
             novel_id
         )
+
         .order(
             "chapter_number"
         )
+
         .execute()
+
     )
 
+
     return result.data
-
-
-# =========================================================
-# UPDATE NOVEL ACTIVITY
-# =========================================================
-
-def update_novel_activity(
-    novel_id,
-    translated_words=None,
-    status=None
-):
-
-    data = {}
-
-    if translated_words is not None:
-
-        data[
-            "translated_words"
-        ] = translated_words
-
-    if status is not None:
-
-        data[
-            "status"
-        ] = status
-
-    if not data:
-        return
-
-    try:
-
-        (
-            supabase
-            .table("novels")
-            .update(data)
-            .eq(
-                "id",
-                novel_id
-            )
-            .execute()
-        )
-
-    except Exception as error:
-
-        print(
-            "Database activity update error:",
-            str(error)
-        )
 
 
 # =========================================================
@@ -611,6 +637,8 @@ def translation_worker(novel_id):
 
     global current_translation_novel
     global last_translation_activity
+    global last_stop_alert_novel
+
 
     if not translation_lock.acquire(
         blocking=False
@@ -618,9 +646,13 @@ def translation_worker(novel_id):
 
         return
 
+
     current_translation_novel = novel_id
 
     last_translation_activity = time.time()
+
+    last_stop_alert_novel = None
+
 
     try:
 
@@ -628,8 +660,11 @@ def translation_worker(novel_id):
             novel_id
         )
 
+
         translated_words = 0
 
+
+        # Count chapters that were already translated.
         for chapter in chapters:
 
             if (
@@ -638,25 +673,47 @@ def translation_worker(novel_id):
             ):
 
                 translated_words += (
+
                     chapter.get(
                         "translated_words",
                         0
                     )
+
                     or 0
+
                 )
 
-        update_novel_activity(
-            novel_id,
-            translated_words,
-            "translating"
+
+        # Set novel to translating.
+        (
+            supabase
+            .table("novels")
+            .update(
+                {
+                    "status": "translating",
+                    "translated_words":
+                        translated_words
+                }
+            )
+            .eq(
+                "id",
+                novel_id
+            )
+            .execute()
         )
 
+
         # =================================================
-        # CHAPTERS
+        # CHAPTER BY CHAPTER
         # =================================================
 
         for chapter in chapters:
 
+            # IMPORTANT:
+            # Completely translated chapters are skipped.
+            #
+            # This means pressing Resume does NOT
+            # translate them again.
             if (
                 chapter.get("status")
                 == "translated"
@@ -664,19 +721,45 @@ def translation_worker(novel_id):
 
                 continue
 
+
             original = (
+
                 chapter.get(
                     "original_text",
                     ""
                 )
+
                 or ""
+
             )
+
 
             if not original.strip():
 
+                # Empty chapters are considered translated
+                # so they don't block the novel.
+                (
+                    supabase
+                    .table("chapters")
+                    .update(
+                        {
+                            "status": "translated",
+                            "translated_text": "",
+                            "translated_words": 0
+                        }
+                    )
+                    .eq(
+                        "id",
+                        chapter["id"]
+                    )
+                    .execute()
+                )
+
                 continue
 
+
             last_translation_activity = time.time()
+
 
             try:
 
@@ -684,16 +767,20 @@ def translation_worker(novel_id):
                     original
                 )
 
+
                 last_translation_activity = time.time()
+
 
                 words = count_words(
                     translated
                 )
 
-                # =================================================
-                # SAVE TRANSLATION IMMEDIATELY
-                # =================================================
 
+                # SAVE THE COMPLETED CHAPTER IMMEDIATELY.
+                #
+                # This is important because if the next
+                # chapter fails, this chapter is already
+                # safely stored in Supabase.
                 (
                     supabase
                     .table("chapters")
@@ -716,77 +803,103 @@ def translation_worker(novel_id):
                     .execute()
                 )
 
+
                 translated_words += words
 
-                update_novel_activity(
-                    novel_id,
-                    translated_words,
-                    "translating"
+
+                # Update total progress immediately.
+                (
+                    supabase
+                    .table("novels")
+                    .update(
+                        {
+                            "translated_words":
+                                translated_words,
+
+                            "status":
+                                "translating"
+                        }
+                    )
+                    .eq(
+                        "id",
+                        novel_id
+                    )
+                    .execute()
                 )
 
-                print(
-                    "Chapter",
-                    chapter["chapter_number"],
-                    "completed.",
-                    "Translated:",
-                    words,
-                    "Total:",
-                    translated_words
-                )
 
                 # =================================================
-                # 30K ALERT
+                # 30,000 WORD ALERT
                 # =================================================
 
                 previous_words = (
                     translated_words - words
                 )
 
+
                 if (
                     translated_words >= 30000
                     and previous_words < 30000
                 ):
 
-                    novel_result = (
-                        supabase
-                        .table("novels")
-                        .select("title")
-                        .eq(
-                            "id",
-                            novel_id
+                    try:
+
+                        novel_result = (
+
+                            supabase
+                            .table("novels")
+                            .select("title")
+                            .eq(
+                                "id",
+                                novel_id
+                            )
+                            .single()
+                            .execute()
                         )
-                        .single()
-                        .execute()
-                    )
 
-                    novel_data = (
-                        novel_result.data
-                        or {}
-                    )
 
-                    title = novel_data.get(
-                        "title",
-                        "Novel"
-                    )
+                        novel_data = (
+                            novel_result.data
+                            or {}
+                        )
 
-                    send_telegram(
-                        "🎉 30,000 WORDS REACHED!\n\n"
-                        + title
-                        + "\n\n"
-                        + "Translated words: "
-                        + f"{translated_words:,}"
-                        + "\n\n"
-                        + "Downloads are unlocked."
-                    )
+
+                        title = novel_data.get(
+                            "title",
+                            "Novel"
+                        )
+
+
+                        send_telegram(
+                            "🎉 30,000 WORDS REACHED!\n\n"
+                            + title
+                            + "\n\n"
+                            + "Translated words: "
+                            + f"{translated_words:,}"
+                            + "\n\n"
+                            + "Downloads are available."
+                        )
+
+                    except Exception as error:
+
+                        print(
+                            "30k alert error:",
+                            str(error)
+                        )
+
 
                 del translated
+
                 del original
 
                 gc.collect()
 
+
                 last_translation_activity = time.time()
 
+
                 time.sleep(1)
+
 
             except Exception as error:
 
@@ -795,34 +908,79 @@ def translation_worker(novel_id):
                     str(error)
                 )
 
-                update_novel_activity(
-                    novel_id,
-                    translated_words,
-                    "paused"
-                )
 
-                send_telegram(
-                    "🔴 TRANSLATION PAUSED\n\n"
-                    "The translator could not continue after "
-                    f"{MAX_RETRIES} attempts.\n\n"
-                    "Translated words: "
-                    + f"{translated_words:,}"
-                    + "\n\n"
-                    "Open the translator and press "
-                    "\"Resume Translation\"."
-                )
+                # Mark novel paused.
+                try:
+
+                    (
+                        supabase
+                        .table("novels")
+                        .update(
+                            {
+                                "status": "paused",
+
+                                "translated_words":
+                                    translated_words
+                            }
+                        )
+                        .eq(
+                            "id",
+                            novel_id
+                        )
+                        .execute()
+                    )
+
+                except Exception as db_error:
+
+                    print(
+                        "Pause database error:",
+                        str(db_error)
+                    )
+
+
+                # Send exactly one stop notification.
+                if last_stop_alert_novel != novel_id:
+
+                    last_stop_alert_novel = novel_id
+
+                    send_telegram(
+                        "🔴 TRANSLATION PAUSED\n\n"
+                        "Gemini returned an error while translating.\n\n"
+                        "Translated words: "
+                        + f"{translated_words:,}"
+                        + "\n\n"
+                        "The completed chapters are safely saved.\n\n"
+                        "Open the translator and press "
+                        "\"Resume Translation\"."
+                    )
+
 
                 return
+
 
         # =================================================
         # COMPLETE
         # =================================================
 
-        update_novel_activity(
-            novel_id,
-            translated_words,
-            "completed"
+        (
+            supabase
+            .table("novels")
+            .update(
+                {
+                    "translated_words":
+                        translated_words,
+
+                    "status":
+                        "completed"
+                }
+            )
+            .eq(
+                "id",
+                novel_id
+            )
+            .execute()
         )
+
 
         send_telegram(
             "✅ TRANSLATION COMPLETE!\n\n"
@@ -831,6 +989,7 @@ def translation_worker(novel_id):
             + f"{translated_words:,}"
         )
 
+
     except Exception as error:
 
         print(
@@ -838,22 +997,43 @@ def translation_worker(novel_id):
             str(error)
         )
 
+
         try:
 
-            update_novel_activity(
-                novel_id,
-                status="paused"
+            (
+                supabase
+                .table("novels")
+                .update(
+                    {
+                        "status": "paused"
+                    }
+                )
+                .eq(
+                    "id",
+                    novel_id
+                )
+                .execute()
             )
 
-        except Exception:
-            pass
+        except Exception as db_error:
 
-        send_telegram(
-            "🔴 TRANSLATION PAUSED\n\n"
-            "The translation worker stopped unexpectedly.\n\n"
-            "Please open the translator and press "
-            "\"Resume Translation\"."
-        )
+            print(
+                "Worker pause database error:",
+                str(db_error)
+            )
+
+
+        if last_stop_alert_novel != novel_id:
+
+            last_stop_alert_novel = novel_id
+
+            send_telegram(
+                "🔴 TRANSLATION PAUSED\n\n"
+                "The translation worker stopped unexpectedly.\n\n"
+                "Please open the translator and press "
+                "\"Resume Translation\"."
+            )
+
 
     finally:
 
@@ -867,13 +1047,15 @@ def translation_worker(novel_id):
 
 
 # =========================================================
-# 2-MINUTE HEARTBEAT MONITOR
+# HEARTBEAT MONITOR
 # =========================================================
 
 def heartbeat_monitor():
 
     global current_translation_novel
     global last_translation_activity
+    global last_stop_alert_novel
+
 
     while True:
 
@@ -889,19 +1071,24 @@ def heartbeat_monitor():
                     - last_translation_activity
                 )
 
-                if elapsed > STOP_TIMEOUT:
+
+                # IMPORTANT:
+                #
+                # This checks every 10 seconds.
+                #
+                # If Gemini has produced no activity
+                # for 2 minutes, the novel is paused.
+                if elapsed >= STOP_TIMEOUT:
 
                     novel_id = (
                         current_translation_novel
                     )
 
-                    print(
-                        "HEARTBEAT: No activity for more than 2 minutes."
-                    )
 
                     try:
 
                         novel_result = (
+
                             supabase
                             .table("novels")
                             .select("*")
@@ -913,10 +1100,11 @@ def heartbeat_monitor():
                             .execute()
                         )
 
+
                         novel = (
                             novel_result.data
-                            or {}
                         )
+
 
                         if (
                             novel
@@ -940,31 +1128,41 @@ def heartbeat_monitor():
                                 .execute()
                             )
 
-                            translated_words = (
-                                novel.get(
-                                    "translated_words",
-                                    0
+
+                            if (
+                                last_stop_alert_novel
+                                != novel_id
+                            ):
+
+                                last_stop_alert_novel = (
+                                    novel_id
                                 )
-                                or 0
-                            )
 
-                            title = novel.get(
-                                "title",
-                                "Novel"
-                            )
 
-                            send_telegram(
-                                "🔴 TRANSLATION STOPPED\n\n"
-                                + title
-                                + "\n\n"
-                                "No translation activity has been "
-                                "detected for more than 2 minutes.\n\n"
-                                "Translated words: "
-                                + f"{translated_words:,}"
-                                + "\n\n"
-                                "Open the translator and press "
-                                "\"Resume Translation\"."
-                            )
+                                translated_words = (
+
+                                    novel.get(
+                                        "translated_words",
+                                        0
+                                    )
+
+                                    or 0
+
+                                )
+
+
+                                send_telegram(
+                                    "🔴 TRANSLATION PAUSED\n\n"
+                                    "No translation activity has been "
+                                    "detected for 2 minutes.\n\n"
+                                    "Translated words: "
+                                    + f"{translated_words:,}"
+                                    + "\n\n"
+                                    "The completed chapters are safely saved.\n\n"
+                                    "Open the translator and press "
+                                    "\"Resume Translation\"."
+                                )
+
 
                     except Exception as error:
 
@@ -973,9 +1171,11 @@ def heartbeat_monitor():
                             str(error)
                         )
 
+
                     current_translation_novel = None
 
                     last_translation_activity = 0
+
 
         except Exception as error:
 
@@ -984,6 +1184,8 @@ def heartbeat_monitor():
                 str(error)
             )
 
+
+        # Check every 10 seconds.
         time.sleep(10)
 
 
@@ -997,27 +1199,6 @@ heartbeat_thread = threading.Thread(
 )
 
 heartbeat_thread.start()
-
-
-# =========================================================
-# DOWNLOADS
-# =========================================================
-
-# IMPORTANT:
-# There is NO 30,000-word download requirement anymore.
-# Any completed translation can be downloaded.
-
-def download_allowed(novel):
-
-    translated_words = (
-        novel.get(
-            "translated_words",
-            0
-        )
-        or 0
-    )
-
-    return translated_words > 0
 
 
 # =========================================================
@@ -1035,17 +1216,20 @@ def get_chinese_title(novel):
         filename
     )[0]
 
+
     if contains_chinese(
         filename_title
     ):
 
         return filename_title
 
+
     try:
 
         chapters = get_chapters(
             novel["id"]
         )
+
 
         if chapters:
 
@@ -1054,25 +1238,92 @@ def get_chinese_title(novel):
                 ""
             )
 
+
             lines = [
+
                 line.strip()
+
                 for line in first_text.splitlines()
+
                 if line.strip()
+
             ]
+
 
             for line in lines[:5]:
 
-                if contains_chinese(line):
+                if (
+                    contains_chinese(line)
+                    and not is_chapter_heading(line)
+                ):
 
-                    if not is_chapter_heading(line):
+                    return line
 
-                        return line
 
     except Exception:
 
         pass
 
+
     return ""
+
+
+# =========================================================
+# DOWNLOAD
+# =========================================================
+
+# IMPORTANT:
+#
+# There is NO 30,000-word download requirement anymore.
+#
+# Any novel with at least one completed translated chapter
+# can be downloaded.
+#
+# Unfinished chapters are automatically skipped.
+#
+# This means:
+#
+# 1 completed chapter = downloadable
+#
+# 100 completed chapters = downloadable
+#
+# Novel still translating = downloadable
+#
+# Novel paused = downloadable
+#
+# =========================================================
+
+def download_allowed(novel_id):
+
+    try:
+
+        chapters = get_chapters(
+            novel_id
+        )
+
+
+        for chapter in chapters:
+
+            translated = (
+                chapter.get(
+                    "translated_text",
+                    ""
+                )
+                or ""
+            )
+
+
+            if translated.strip():
+
+                return True
+
+
+    except Exception:
+
+        pass
+
+
+    return False
 
 
 # =========================================================
@@ -1090,116 +1341,154 @@ def download_txt(novel_id):
     if protection:
         return protection
 
-    novel_result = (
-        supabase
-        .table("novels")
-        .select("*")
-        .eq(
-            "id",
+
+    if not supabase:
+        return "Supabase is not configured.", 500
+
+
+    try:
+
+        novel_result = (
+
+            supabase
+            .table("novels")
+            .select("*")
+            .eq(
+                "id",
+                novel_id
+            )
+            .single()
+            .execute()
+        )
+
+
+        novel = novel_result.data
+
+
+        if not novel:
+
+            return "Novel not found.", 404
+
+
+        if not download_allowed(
+            novel_id
+        ):
+
+            return (
+                "There are no completed translated chapters "
+                "available for download yet."
+            ), 403
+
+
+        chapters = get_chapters(
             novel_id
         )
-        .single()
-        .execute()
-    )
 
-    novel = novel_result.data
 
-    if not novel:
-        return "Novel not found.", 404
+        output = []
 
-    if not download_allowed(novel):
 
-        return (
-            "No translated chapters are available yet."
-        ), 403
-
-    chapters = get_chapters(
-        novel_id
-    )
-
-    output = []
-
-    chinese_title = get_chinese_title(
-        novel
-    )
-
-    if chinese_title:
-
-        output.append(
-            chinese_title
+        chinese_title = get_chinese_title(
+            novel
         )
 
-        output.append("")
 
-    output.append(
-        "English Title: "
-        + novel["title"]
-    )
+        if chinese_title:
 
-    output.append("")
-
-    completed_count = 0
-
-    for chapter in chapters:
-
-        translated = (
-            chapter.get(
-                "translated_text",
-                ""
+            output.append(
+                chinese_title
             )
-            or ""
-        )
 
-        # =================================================
-        # IMPORTANT:
-        # SKIP UNFINISHED CHAPTERS
-        # =================================================
+            output.append("")
 
-        if not translated.strip():
-            continue
-
-        completed_count += 1
 
         output.append(
-            chapter.get(
+            "English Title: "
+            + novel.get(
                 "title",
-                f"Chapter {chapter['chapter_number']}"
+                "Novel"
             )
-        )
-
-        output.append(
-            translated
         )
 
         output.append("")
 
-    if completed_count == 0:
+
+        # ONLY completed chapters are included.
+        for chapter in chapters:
+
+            translated = (
+
+                chapter.get(
+                    "translated_text",
+                    ""
+                )
+
+                or ""
+
+            )
+
+
+            if not translated.strip():
+
+                continue
+
+
+            output.append(
+                chapter.get(
+                    "title",
+                    f"Chapter {chapter['chapter_number']}"
+                )
+            )
+
+
+            output.append(
+                translated
+            )
+
+
+            output.append("")
+
+
+        content = "\n".join(
+            output
+        )
+
+
+        data = io.BytesIO(
+            content.encode(
+                "utf-8"
+            )
+        )
+
+
+        filename = (
+            novel.get(
+                "title",
+                "novel"
+            )
+            + "_translated.txt"
+        )
+
+
+        return send_file(
+
+            data,
+
+            mimetype="text/plain; charset=utf-8",
+
+            as_attachment=True,
+
+            download_name=filename
+
+        )
+
+
+    except Exception as error:
 
         return (
-            "No completed chapters are available yet."
-        ), 403
-
-    content = "\n".join(
-        output
-    )
-
-    data = io.BytesIO(
-        content.encode(
-            "utf-8"
-        )
-    )
-
-    filename = (
-        novel["title"]
-        + "_translated.txt"
-    )
-
-    return send_file(
-        data,
-        mimetype="text/plain",
-        as_attachment=True,
-        download_name=filename
-    )
+            "Download error: "
+            + str(error)
+        ), 500
 
 
 # =========================================================
@@ -1217,233 +1506,306 @@ def download_epub(novel_id):
     if protection:
         return protection
 
-    novel_result = (
-        supabase
-        .table("novels")
-        .select("*")
-        .eq(
-            "id",
+
+    if not supabase:
+        return "Supabase is not configured.", 500
+
+
+    try:
+
+        novel_result = (
+
+            supabase
+            .table("novels")
+            .select("*")
+            .eq(
+                "id",
+                novel_id
+            )
+            .single()
+            .execute()
+        )
+
+
+        novel = novel_result.data
+
+
+        if not novel:
+
+            return "Novel not found.", 404
+
+
+        if not download_allowed(
+            novel_id
+        ):
+
+            return (
+                "There are no completed translated chapters "
+                "available for download yet."
+            ), 403
+
+
+        chapters = get_chapters(
             novel_id
         )
-        .single()
-        .execute()
-    )
 
-    novel = novel_result.data
 
-    if not novel:
-        return "Novel not found.", 404
+        book = epub.EpubBook()
 
-    if not download_allowed(novel):
 
-        return (
-            "No translated chapters are available yet."
-        ), 403
+        book.set_identifier(
+            str(novel_id)
+        )
 
-    chapters = get_chapters(
-        novel_id
-    )
 
-    book = epub.EpubBook()
+        english_title = novel.get(
+            "title",
+            "Novel"
+        )
 
-    book.set_identifier(
-        str(novel_id)
-    )
 
-    book.set_title(
-        novel["title"]
-    )
+        book.set_title(
+            english_title
+        )
 
-    book.set_language(
-        "en"
-    )
 
-    spine = ["nav"]
+        book.set_language(
+            "en"
+        )
 
-    epub_chapters = []
 
-    # =====================================================
-    # TITLE PAGE
-    # =====================================================
+        spine = [
+            "nav"
+        ]
 
-    title_page = epub.EpubHtml(
-        title="Title",
-        file_name="title.xhtml",
-        lang="en"
-    )
 
-    chinese_title = get_chinese_title(
-        novel
-    )
+        epub_chapters = []
 
-    title_html = ""
 
-    if chinese_title:
+        # =================================================
+        # TITLE PAGE
+        # =================================================
+
+        title_page = epub.EpubHtml(
+
+            title="Title",
+
+            file_name="title.xhtml",
+
+            lang="en"
+
+        )
+
+
+        chinese_title = get_chinese_title(
+            novel
+        )
+
+
+        title_html = ""
+
+
+        if chinese_title:
+
+            title_html += (
+                "<h1>"
+                + escape(chinese_title)
+                + "</h1>"
+            )
+
 
         title_html += (
-            "<h1>"
-            + html.escape(chinese_title)
-            + "</h1>"
+            "<h2>English Title: "
+            + escape(english_title)
+            + "</h2>"
         )
 
-    safe_english = html.escape(
-        novel["title"]
-    )
 
-    title_html += (
-        "<h2>English Title: "
-        + safe_english
-        + "</h2>"
-    )
-
-    title_page.content = f"""
-    <html>
-    <head>
-    <title>{safe_english}</title>
-    </head>
-    <body>
-    {title_html}
-    </body>
-    </html>
-    """
-
-    book.add_item(
-        title_page
-    )
-
-    epub_chapters.append(
-        title_page
-    )
-
-    spine.append(
-        title_page
-    )
-
-    # =====================================================
-    # CHAPTERS
-    # =====================================================
-
-    completed_count = 0
-
-    for chapter in chapters:
-
-        translated = (
-            chapter.get(
-                "translated_text",
-                ""
-            )
-            or ""
-        )
-
-        # =================================================
-        # SKIP UNFINISHED CHAPTERS
-        # =================================================
-
-        if not translated.strip():
-            continue
-
-        completed_count += 1
-
-        chapter_number = (
-            chapter["chapter_number"]
-        )
-
-        title = (
-            chapter.get(
-                "title",
-                f"Chapter {chapter_number}"
-            )
-        )
-
-        c = epub.EpubHtml(
-            title=title,
-            file_name=(
-                f"chapter_{chapter_number}.xhtml"
-            ),
-            lang="en"
-        )
-
-        paragraphs = translated.split(
-            "\n"
-        )
-
-        body_html = ""
-
-        for paragraph in paragraphs:
-
-            paragraph = paragraph.strip()
-
-            if not paragraph:
-                continue
-
-            body_html += (
-                "<p>"
-                + html.escape(paragraph)
-                + "</p>"
-            )
-
-        safe_title = html.escape(
-            title
-        )
-
-        c.content = f"""
+        title_page.content = f"""
         <html>
         <head>
-        <title>{safe_title}</title>
+            <title>{escape(english_title)}</title>
         </head>
         <body>
-        <h1>{safe_title}</h1>
-        {body_html}
+            {title_html}
         </body>
         </html>
         """
 
-        book.add_item(c)
 
-        epub_chapters.append(c)
+        book.add_item(
+            title_page
+        )
 
-        spine.append(c)
 
-    if completed_count == 0:
+        epub_chapters.append(
+            title_page
+        )
+
+
+        spine.append(
+            title_page
+        )
+
+
+        # =================================================
+        # COMPLETED CHAPTERS ONLY
+        # =================================================
+
+        for chapter in chapters:
+
+            translated = (
+
+                chapter.get(
+                    "translated_text",
+                    ""
+                )
+
+                or ""
+
+            )
+
+
+            # Unfinished chapter is skipped.
+            if not translated.strip():
+
+                continue
+
+
+            chapter_number = (
+                chapter[
+                    "chapter_number"
+                ]
+            )
+
+
+            title = (
+
+                chapter.get(
+                    "title",
+                    f"Chapter {chapter_number}"
+                )
+
+            )
+
+
+            c = epub.EpubHtml(
+
+                title=title,
+
+                file_name=(
+                    f"chapter_{chapter_number}.xhtml"
+                ),
+
+                lang="en"
+
+            )
+
+
+            paragraphs = translated.split(
+                "\n"
+            )
+
+
+            html = ""
+
+
+            for paragraph in paragraphs:
+
+                paragraph = paragraph.strip()
+
+
+                if not paragraph:
+                    continue
+
+
+                html += (
+                    "<p>"
+                    + escape(paragraph)
+                    + "</p>"
+                )
+
+
+            safe_title = escape(
+                title
+            )
+
+
+            c.content = f"""
+            <html>
+            <head>
+                <title>{safe_title}</title>
+            </head>
+            <body>
+                <h1>{safe_title}</h1>
+                {html}
+            </body>
+            </html>
+            """
+
+
+            book.add_item(c)
+
+            epub_chapters.append(c)
+
+            spine.append(c)
+
+
+        book.toc = tuple(
+            epub_chapters
+        )
+
+
+        book.add_item(
+            epub.EpubNcx()
+        )
+
+
+        book.add_item(
+            epub.EpubNav()
+        )
+
+
+        book.spine = spine
+
+
+        output = io.BytesIO()
+
+
+        epub.write_epub(
+            output,
+            book
+        )
+
+
+        output.seek(0)
+
+
+        filename = (
+            english_title
+            + "_translated.epub"
+        )
+
+
+        return send_file(
+
+            output,
+
+            mimetype="application/epub+zip",
+
+            as_attachment=True,
+
+            download_name=filename
+
+        )
+
+
+    except Exception as error:
 
         return (
-            "No completed chapters are available yet."
-        ), 403
-
-    book.toc = tuple(
-        epub_chapters
-    )
-
-    book.add_item(
-        epub.EpubNcx()
-    )
-
-    book.add_item(
-        epub.EpubNav()
-    )
-
-    book.spine = spine
-
-    output = io.BytesIO()
-
-    epub.write_epub(
-        output,
-        book
-    )
-
-    output.seek(0)
-
-    filename = (
-        novel["title"]
-        + "_translated.epub"
-    )
-
-    return send_file(
-        output,
-        mimetype="application/epub+zip",
-        as_attachment=True,
-        download_name=filename
-    )
+            "EPUB download error: "
+            + str(error)
+        ), 500
 
 
 # =========================================================
@@ -1462,14 +1824,29 @@ def delete_novel(novel_id):
     if protection:
         return protection
 
+
+    global current_translation_novel
+    global last_stop_alert_novel
+
+
     try:
 
-        global current_translation_novel
-
+        # Forget active worker.
+        #
+        # IMPORTANT:
+        # We intentionally DO NOT send a Telegram
+        # notification when deleting a novel.
         if current_translation_novel == novel_id:
 
             current_translation_novel = None
 
+
+        if last_stop_alert_novel == novel_id:
+
+            last_stop_alert_novel = None
+
+
+        # Delete chapters.
         (
             supabase
             .table("chapters")
@@ -1481,6 +1858,8 @@ def delete_novel(novel_id):
             .execute()
         )
 
+
+        # Delete translation batches if the table exists.
         try:
 
             (
@@ -1498,6 +1877,8 @@ def delete_novel(novel_id):
 
             pass
 
+
+        # Delete novel.
         (
             supabase
             .table("novels")
@@ -1509,18 +1890,19 @@ def delete_novel(novel_id):
             .execute()
         )
 
-        # IMPORTANT:
+
         # NO TELEGRAM MESSAGE HERE.
-        # Deleting a novel will NOT send a notification.
+
 
         return redirect("/")
+
 
     except Exception as error:
 
         return (
             "Delete error: "
             + str(error)
-        )
+        ), 500
 
 
 # =========================================================
@@ -1536,50 +1918,84 @@ LOGIN_HTML = """
 <head>
 
 <meta name="viewport"
-content="width=device-width, initial-scale=1">
+      content="width=device-width, initial-scale=1">
 
 <title>Novel Translator Login</title>
 
 <style>
 
 body {
+
     font-family: Arial, sans-serif;
+
     max-width: 500px;
+
     margin: auto;
+
     padding: 20px;
+
     background: #f5f5f5;
+
 }
 
 .box {
+
     background: white;
+
     padding: 25px;
+
     border-radius: 12px;
+
     margin-top: 60px;
+
 }
 
 input {
+
     width: 100%;
+
     padding: 14px;
+
     margin: 12px 0;
+
     box-sizing: border-box;
+
     border: 1px solid #ccc;
+
     border-radius: 8px;
+
+    font-size: 16px;
+
 }
 
 button {
+
     width: 100%;
+
     padding: 14px;
+
     border: none;
+
     border-radius: 8px;
+
     background: #333;
+
     color: white;
+
     font-size: 16px;
+
 }
 
 .error {
+
     background: #f8d7da;
+
     padding: 12px;
+
     border-radius: 8px;
+
+    margin-bottom: 10px;
+
 }
 
 </style>
@@ -1605,13 +2021,13 @@ button {
 {% endif %}
 
 <form method="POST"
-action="/login">
+      action="/login">
 
 <input
-type="password"
-name="password"
-placeholder="Password"
-required
+    type="password"
+    name="password"
+    placeholder="Password"
+    required
 >
 
 <button type="submit">
@@ -1632,6 +2048,65 @@ Login
 
 
 # =========================================================
+# LOGIN ROUTE
+# =========================================================
+
+@app.route(
+    "/login",
+    methods=["GET", "POST"]
+)
+
+def login():
+
+    if request.method == "POST":
+
+        password = request.form.get(
+            "password",
+            ""
+        )
+
+
+        if (
+            SITE_PASSWORD
+            and password == SITE_PASSWORD
+        ):
+
+            session["logged_in"] = True
+
+            return redirect("/")
+
+
+        return render_template_string(
+
+            LOGIN_HTML,
+
+            error="Incorrect password."
+
+        )
+
+
+    return render_template_string(
+
+        LOGIN_HTML,
+
+        error=None
+
+    )
+
+
+# =========================================================
+# LOGOUT
+# =========================================================
+
+@app.route("/logout")
+def logout():
+
+    session.clear()
+
+    return redirect("/login")
+
+
+# =========================================================
 # MAIN HTML
 # =========================================================
 
@@ -1644,104 +2119,162 @@ HTML = """
 <head>
 
 <meta name="viewport"
-content="width=device-width, initial-scale=1">
+      content="width=device-width, initial-scale=1">
 
 <title>Novel Translator</title>
 
 <style>
 
 body {
+
     font-family: Arial, sans-serif;
+
     max-width: 800px;
+
     margin: auto;
+
     padding: 20px;
+
     background: #f5f5f5;
+
 }
 
 .box {
+
     background: white;
+
     padding: 20px;
+
     border-radius: 12px;
+
     margin-bottom: 20px;
+
 }
 
 button {
+
     padding: 12px 20px;
+
     border: none;
+
     border-radius: 8px;
+
     background: #333;
+
     color: white;
+
     font-size: 16px;
+
 }
 
 input {
+
     width: 100%;
+
     padding: 12px;
+
     margin: 10px 0;
+
     box-sizing: border-box;
+
 }
 
 .progress {
+
     background: #ddd;
+
     border-radius: 10px;
+
     overflow: hidden;
+
     height: 24px;
+
 }
 
 .bar {
+
     background: #333;
+
     height: 24px;
+
 }
 
 .status {
+
     padding: 12px;
+
     background: #eee;
+
     border-radius: 8px;
+
 }
 
 .warning {
+
     background: #fff3cd;
+
     padding: 12px;
+
     border-radius: 8px;
+
 }
 
 .success {
+
     background: #d4edda;
+
     padding: 12px;
+
     border-radius: 8px;
+
 }
 
 .download {
+
     display: block;
+
     margin-top: 12px;
+
+    text-decoration: none;
+
 }
 
 .download button {
+
     width: 100%;
+
 }
 
 .delete {
+
     margin-top: 25px;
+
     padding-top: 20px;
+
     border-top: 1px solid #ddd;
+
 }
 
 .delete button {
+
     background: #b00020;
+
     width: 100%;
+
 }
 
 .logout {
+
     text-align: right;
+
     margin-bottom: 15px;
+
 }
 
 .logout a {
-    color: #555;
-}
 
-#liveStatus {
-    margin-top: 10px;
+    color: #555;
+
 }
 
 </style>
@@ -1763,25 +2296,25 @@ input {
 <h2>Upload Novel</h2>
 
 <p>
-The title is detected automatically from the file.
-</p>
 
-<p>
+The title is detected automatically from the file.
+
 If a Chinese title is found, it will appear before
 the English title in the downloaded TXT and EPUB.
+
 </p>
 
 <form method="POST"
-action="/upload"
-enctype="multipart/form-data">
+      action="/upload"
+      enctype="multipart/form-data">
 
 <label>Novel File</label>
 
 <input
-type="file"
-name="novel"
-accept=".txt,.epub"
-required
+    type="file"
+    name="novel"
+    accept=".txt,.epub"
+    required
 >
 
 <button type="submit">
@@ -1793,7 +2326,6 @@ Upload Novel
 </form>
 
 </div>
-
 
 {% if message %}
 
@@ -1809,7 +2341,6 @@ Upload Novel
 
 {% endif %}
 
-
 {% if novel %}
 
 <div class="box">
@@ -1819,7 +2350,6 @@ Upload Novel
 {{ novel.title }}
 
 </h2>
-
 
 {% if chinese_title %}
 
@@ -1837,7 +2367,6 @@ Chinese Title:
 
 {% endif %}
 
-
 <p>
 
 Original words:
@@ -1845,49 +2374,45 @@ Original words:
 <strong>
 
 {{ "{:,}".format(
-novel.total_words or 0
+    novel.total_words or 0
 ) }}
 
 </strong>
 
 </p>
-
 
 <p>
 
 Translated words:
 
-<strong id="translatedWords">
+<strong>
 
 {{ "{:,}".format(
-novel.translated_words or 0
+    novel.translated_words or 0
 ) }}
 
 </strong>
 
 </p>
-
 
 {% if novel.total_words %}
 
 <div class="progress">
 
 <div
-id="progressBar"
-class="bar"
-style="width: {{ progress }}%;"
+    class="bar"
+    style="width: {{ progress }}%;"
 ></div>
 
 </div>
 
 {% endif %}
 
-
 <p>
 
 Status:
 
-<strong id="translationStatus">
+<strong>
 
 {{ novel.status }}
 
@@ -1896,11 +2421,8 @@ Status:
 </p>
 
 
-<div id="liveStatus"></div>
-
-
 {% if novel.status == "waiting"
-or novel.status == "paused" %}
+   or novel.status == "paused" %}
 
 <a href="/translate/{{ novel.id }}">
 
@@ -1929,12 +2451,20 @@ or novel.status == "paused" %}
 
 <br><br>
 
-You can leave this page open.
+The page refreshes automatically every
+10 seconds.
 
 <br><br>
 
-The page no longer performs a full refresh,
-so refreshing the page will not be used for progress updates.
+If no translation activity is detected for
+2 minutes, the translation will be marked
+as paused and Telegram will notify you.
+
+<br><br>
+
+Completed chapters are already saved and
+can be downloaded even while translation
+continues.
 
 </div>
 
@@ -1952,22 +2482,26 @@ so refreshing the page will not be used for progress updates.
 
 <hr>
 
-
 <h3>📥 Downloads</h3>
 
 <p>
 
-Downloads contain only chapters that are completely
-translated. An unfinished chapter is automatically skipped.
+Downloads contain <strong>only chapters that have
+finished translating</strong>.
 
 </p>
 
+<p>
 
-{% if novel.translated_words > 0 %}
+An unfinished chapter is automatically skipped.
+
+</p>
+
+{% if has_downloads %}
 
 <a
-class="download"
-href="/download/txt/{{ novel.id }}"
+    class="download"
+    href="/download/txt/{{ novel.id }}"
 >
 
 <button>
@@ -1978,10 +2512,9 @@ href="/download/txt/{{ novel.id }}"
 
 </a>
 
-
 <a
-class="download"
-href="/download/epub/{{ novel.id }}"
+    class="download"
+    href="/download/epub/{{ novel.id }}"
 >
 
 <button>
@@ -1996,7 +2529,8 @@ href="/download/epub/{{ novel.id }}"
 
 <div class="warning">
 
-No completed translation is available yet.
+⏳ No completed translated chapters are available
+for download yet.
 
 </div>
 
@@ -2006,9 +2540,9 @@ No completed translation is available yet.
 <div class="delete">
 
 <form
-method="POST"
-action="/delete/{{ novel.id }}"
-onsubmit="return confirm('Delete this novel and all its translations? This cannot be undone.')"
+    method="POST"
+    action="/delete/{{ novel.id }}"
+    onsubmit="return confirm('Delete this novel and all its translations? This cannot be undone.')"
 >
 
 <button type="submit">
@@ -2021,7 +2555,6 @@ onsubmit="return confirm('Delete this novel and all its translations? This canno
 
 </div>
 
-
 </div>
 
 {% endif %}
@@ -2029,136 +2562,23 @@ onsubmit="return confirm('Delete this novel and all its translations? This canno
 
 <script>
 
-{% if novel %}
+/*
+Refresh the page every 10 seconds.
 
-const novelId = "{{ novel.id }}";
+This ONLY refreshes the webpage.
 
-let lastKnownWords =
-{{ novel.translated_words or 0 }};
+It does NOT stop the translation worker.
 
+Translation continues on the server independently.
+*/
 
-async function updateProgress() {
+setTimeout(function() {
 
-    try {
+    window.location.reload();
 
-        const response =
-            await fetch(
-                "/api/progress/" + novelId,
-                {
-                    cache: "no-store"
-                }
-            );
-
-        if (!response.ok) {
-            return;
-        }
-
-        const data =
-            await response.json();
-
-
-        const words =
-            data.translated_words || 0;
-
-
-        const status =
-            data.status || "";
-
-
-        document.getElementById(
-            "translatedWords"
-        ).textContent =
-            words.toLocaleString();
-
-
-        document.getElementById(
-            "translationStatus"
-        ).textContent =
-            status;
-
-
-        {% if novel.total_words %}
-
-        const total =
-            {{ novel.total_words or 1 }};
-
-
-        const percent =
-            Math.min(
-                100,
-                (words / total) * 100
-            );
-
-
-        document.getElementById(
-            "progressBar"
-        ).style.width =
-            percent + "%";
-
-        {% endif %}
-
-
-        const live =
-            document.getElementById(
-                "liveStatus"
-            );
-
-
-        if (status === "translating") {
-
-            live.innerHTML =
-                "⏳ Translation is running...";
-
-        }
-        else if (status === "paused") {
-
-            live.innerHTML =
-                "⏸️ Translation is paused. " +
-                "Press Resume Translation.";
-
-        }
-        else if (status === "completed") {
-
-            live.innerHTML =
-                "✅ Translation complete!";
-
-        }
-
-
-        if (
-            status !== "translating"
-            && status !== "paused"
-            && status !== "completed"
-        ) {
-
-            return;
-
-        }
-
-    }
-    catch (error) {
-
-        console.log(
-            "Progress update error:",
-            error
-        );
-
-    }
-
-}
-
-
-// Update every 5 seconds.
-// This does NOT reload the page.
-setInterval(
-    updateProgress,
-    5000
-);
-
-{% endif %}
+}, 10000);
 
 </script>
-
 
 </body>
 
@@ -2179,8 +2599,11 @@ def home():
     if protection:
         return protection
 
+
     novel = None
+
     message = None
+
 
     if not supabase:
 
@@ -2201,26 +2624,39 @@ def home():
                 + str(error)
             )
 
+
     progress = 0
+
     chinese_title = ""
+
+    has_downloads = False
+
 
     if novel:
 
         total = (
+
             novel.get(
                 "total_words",
                 0
             )
+
             or 0
+
         )
 
+
         translated = (
+
             novel.get(
                 "translated_words",
                 0
             )
+
             or 0
+
         )
+
 
         if total > 0:
 
@@ -2228,84 +2664,35 @@ def home():
                 translated / total
             ) * 100
 
+
         chinese_title = get_chinese_title(
             novel
         )
 
+
+        has_downloads = download_allowed(
+            novel["id"]
+        )
+
+
     return render_template_string(
+
         HTML,
+
         novel=novel,
+
         message=message,
+
         chinese_title=chinese_title,
+
+        has_downloads=has_downloads,
+
         progress=min(
             progress,
             100
         )
+
     )
-
-
-# =========================================================
-# LIVE PROGRESS API
-# =========================================================
-
-@app.route(
-    "/api/progress/<novel_id>"
-)
-
-def api_progress(novel_id):
-
-    protection = login_required()
-
-    if protection:
-
-        return protection
-
-    try:
-
-        result = (
-            supabase
-            .table("novels")
-            .select(
-                "translated_words,status,total_words"
-            )
-            .eq(
-                "id",
-                novel_id
-            )
-            .single()
-            .execute()
-        )
-
-        novel = result.data
-
-        return {
-            "translated_words":
-                novel.get(
-                    "translated_words",
-                    0
-                )
-                or 0,
-
-            "status":
-                novel.get(
-                    "status",
-                    ""
-                ),
-
-            "total_words":
-                novel.get(
-                    "total_words",
-                    0
-                )
-                or 0
-        }
-
-    except Exception as error:
-
-        return {
-            "error":
-                str(error)
-        }, 500
 
 
 # =========================================================
@@ -2324,38 +2711,68 @@ def upload():
     if protection:
         return protection
 
+
     if not supabase:
 
         return render_template_string(
+
             HTML,
+
             novel=None,
-            message="Supabase is not configured.",
+
+            message=(
+                "Supabase is not configured."
+            ),
+
             progress=0,
-            chinese_title=""
+
+            chinese_title="",
+
+            has_downloads=False
+
         )
+
 
     uploaded_file = request.files.get(
         "novel"
     )
 
+
     if not uploaded_file:
 
         return render_template_string(
+
             HTML,
+
             novel=None,
-            message="Please choose a TXT or EPUB file.",
+
+            message=(
+                "Please choose a TXT or EPUB file."
+            ),
+
             progress=0,
-            chinese_title=""
+
+            chinese_title="",
+
+            has_downloads=False
+
         )
+
 
     filename = (
         uploaded_file.filename
         or "novel"
     )
 
+
     try:
 
         file_bytes = uploaded_file.read()
+
+
+        # =================================================
+        # EXTRACT TEXT
+        # =================================================
 
         if filename.lower().endswith(
             ".txt"
@@ -2365,6 +2782,7 @@ def upload():
                 file_bytes
             )
 
+
         elif filename.lower().endswith(
             ".epub"
         ):
@@ -2373,11 +2791,13 @@ def upload():
                 file_bytes
             )
 
+
         else:
 
             raise RuntimeError(
                 "Only TXT and EPUB files are supported."
             )
+
 
         if not text.strip():
 
@@ -2385,12 +2805,18 @@ def upload():
                 "The uploaded file is empty."
             )
 
+
+        # =================================================
+        # TITLE
+        # =================================================
+
         chinese_title, english_title = (
             detect_titles(
                 text,
                 filename
             )
         )
+
 
         if english_title:
 
@@ -2406,18 +2832,35 @@ def upload():
                 filename
             )[0]
 
-        chapters = split_text_into_chapters(
-            text
+
+        # =================================================
+        # CHAPTERS
+        # =================================================
+
+        chapters = (
+            split_text_into_chapters(
+                text
+            )
         )
 
+
         total_words = sum(
+
             count_words(
                 chapter["text"]
             )
+
             for chapter in chapters
+
         )
 
+
+        # =================================================
+        # CREATE NOVEL
+        # =================================================
+
         novel_result = (
+
             supabase
             .table("novels")
             .insert(
@@ -2439,9 +2882,23 @@ def upload():
                 }
             )
             .execute()
+
         )
 
+
+        if not novel_result.data:
+
+            raise RuntimeError(
+                "Supabase did not create the novel."
+            )
+
+
         novel = novel_result.data[0]
+
+
+        # =================================================
+        # SAVE CHAPTERS
+        # =================================================
 
         for chapter in chapters:
 
@@ -2480,10 +2937,17 @@ def upload():
                 .execute()
             )
 
+
         del file_bytes
+
         del text
 
         gc.collect()
+
+
+        # =================================================
+        # TELEGRAM UPLOAD NOTIFICATION
+        # =================================================
 
         send_telegram(
             "📚 NOVEL UPLOADED\n\n"
@@ -2491,26 +2955,44 @@ def upload():
             + "\n\n"
             + "Original words: "
             + f"{total_words:,}"
+            + "\n\n"
+            + "Press Start Translation on the website."
         )
+
 
         return redirect("/")
 
+
     except Exception as error:
 
+        print(
+            "UPLOAD ERROR:",
+            str(error)
+        )
+
+
         return render_template_string(
+
             HTML,
+
             novel=None,
+
             message=(
                 "Upload error: "
                 + str(error)
             ),
+
             progress=0,
-            chinese_title=""
+
+            chinese_title="",
+
+            has_downloads=False
+
         )
 
 
 # =========================================================
-# START / RESUME
+# START / RESUME TRANSLATION
 # =========================================================
 
 @app.route(
@@ -2524,11 +3006,13 @@ def start_translation(novel_id):
     if protection:
         return protection
 
+
     if not supabase:
 
         return (
             "Supabase is not configured."
-        )
+        ), 500
+
 
     try:
 
@@ -2536,13 +3020,20 @@ def start_translation(novel_id):
             novel_id
         )
 
+
         remaining = [
+
             chapter
+
             for chapter in chapters
+
             if chapter.get("status")
             != "translated"
+
         ]
 
+
+        # Nothing left to translate.
         if not remaining:
 
             (
@@ -2563,30 +3054,40 @@ def start_translation(novel_id):
 
             return redirect("/")
 
+
+        # Another translation is already running.
         if translation_lock.locked():
 
             return redirect("/")
 
+
         thread = threading.Thread(
+
             target=translation_worker,
+
             args=(novel_id,),
+
             daemon=True
+
         )
+
 
         thread.start()
 
+
         return redirect("/")
+
 
     except Exception as error:
 
         return (
             "Unable to start translation: "
             + str(error)
-        )
+        ), 500
 
 
 # =========================================================
-# HEALTH
+# HEALTH CHECK
 # =========================================================
 
 @app.route("/health")
@@ -2608,7 +3109,11 @@ if __name__ == "__main__":
         )
     )
 
+
     app.run(
+
         host="0.0.0.0",
+
         port=port
+
     )
