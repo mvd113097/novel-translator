@@ -4,13 +4,15 @@ import io
 import threading
 import time
 import gc
+import secrets
 
 from flask import (
     Flask,
     request,
     render_template_string,
     redirect,
-    send_file
+    send_file,
+    session
 )
 
 from supabase import create_client
@@ -26,33 +28,36 @@ from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY",
+    secrets.token_hex(32)
+)
+
 
 # =========================================================
 # ENVIRONMENT VARIABLES
 # =========================================================
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-
-# Normal database key
-SUPABASE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY")
-
-# Optional service role key.
-# Put this ONLY in Render Environment Variables.
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
-    "SUPABASE_SERVICE_ROLE_KEY"
+SUPABASE_URL = os.environ.get(
+    "SUPABASE_URL"
 )
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SUPABASE_KEY = os.environ.get(
+    "SUPABASE_PUBLISHABLE_KEY"
+)
+
+GEMINI_API_KEY = os.environ.get(
+    "GEMINI_API_KEY"
+)
+
+SITE_PASSWORD = os.environ.get(
+    "SITE_PASSWORD"
+)
 
 
 supabase = None
-supabase_admin = None
 gemini = None
 
-
-# =========================================================
-# SUPABASE
-# =========================================================
 
 if SUPABASE_URL and SUPABASE_KEY:
 
@@ -61,20 +66,6 @@ if SUPABASE_URL and SUPABASE_KEY:
         SUPABASE_KEY
     )
 
-
-# If service role key exists, use it for database operations
-# that need to bypass RLS, such as deleting a novel.
-if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-
-    supabase_admin = create_client(
-        SUPABASE_URL,
-        SUPABASE_SERVICE_ROLE_KEY
-    )
-
-
-# =========================================================
-# GEMINI
-# =========================================================
 
 if GEMINI_API_KEY:
 
@@ -88,13 +79,27 @@ translation_lock = threading.Lock()
 
 
 # =========================================================
-# DOWNLOAD LIMIT
+# PASSWORD PROTECTION
 # =========================================================
 
-# IMPORTANT:
-# Downloads unlock after 30,000 translated words.
+def is_logged_in():
 
-DOWNLOAD_LIMIT = 30000
+    return session.get(
+        "logged_in",
+        False
+    )
+
+
+def login_required():
+
+    if not is_logged_in():
+
+        return render_template_string(
+            LOGIN_HTML,
+            error=None
+        )
+
+    return None
 
 
 # =========================================================
@@ -121,6 +126,140 @@ def count_words(text):
 
 
 # =========================================================
+# TITLE DETECTION
+# =========================================================
+
+def contains_chinese(text):
+
+    return bool(
+        re.search(
+            r"[\u4e00-\u9fff]",
+            text or ""
+        )
+    )
+
+
+def is_chapter_heading(text):
+
+    if not text:
+        return False
+
+    patterns = [
+
+        r"^第\s*\d+\s*[章节卷回]",
+
+        r"^chapter\s+\d+",
+
+        r"^chap\.\s*\d+"
+
+    ]
+
+    for pattern in patterns:
+
+        if re.search(
+            pattern,
+            text.strip(),
+            re.IGNORECASE
+        ):
+
+            return True
+
+    return False
+
+
+def detect_titles(text, filename):
+
+    """
+    Automatically detects the novel title.
+
+    If the first meaningful line is a Chinese title,
+    it becomes the Chinese title.
+
+    If the first meaningful line is an English title,
+    it is kept as the title.
+
+    If no title is found, the filename is used.
+    """
+
+    lines = [
+
+        line.strip()
+
+        for line in text.splitlines()
+
+        if line.strip()
+
+    ]
+
+
+    chinese_title = ""
+    english_title = ""
+
+
+    # Look at the first few meaningful lines.
+    for line in lines[:10]:
+
+        if is_chapter_heading(line):
+
+            continue
+
+
+        # Ignore obvious prose.
+        if len(line) > 100:
+
+            continue
+
+
+        if contains_chinese(line):
+
+            chinese_title = line
+
+            break
+
+
+        else:
+
+            english_title = line
+
+            break
+
+
+    # If nothing was detected, use filename.
+    filename_title = os.path.splitext(
+        filename
+    )[0].strip()
+
+
+    if not chinese_title and not english_title:
+
+        if contains_chinese(filename_title):
+
+            chinese_title = filename_title
+
+        else:
+
+            english_title = filename_title
+
+
+    # If filename itself contains Chinese and
+    # no Chinese title was found, use filename.
+    if (
+        not chinese_title
+        and contains_chinese(filename_title)
+    ):
+
+        chinese_title = filename_title
+
+
+    # If we found a Chinese title but no English title,
+    # don't invent one.
+    return (
+        chinese_title,
+        english_title
+    )
+
+
+# =========================================================
 # TXT
 # =========================================================
 
@@ -143,6 +282,7 @@ def extract_txt(file_bytes):
 
             pass
 
+
     return file_bytes.decode(
         "utf-8",
         errors="ignore"
@@ -160,6 +300,7 @@ def extract_epub(file_bytes):
     )
 
     sections = []
+
 
     for item in book.get_items():
 
@@ -179,127 +320,10 @@ def extract_epub(file_bytes):
 
                 sections.append(text)
 
+
     return "\n\n".join(
         sections
     )
-
-
-# =========================================================
-# AUTOMATIC TITLE DETECTION
-# =========================================================
-
-def detect_chinese_title(text, filename):
-
-    """
-    Automatically detects a Chinese novel title
-    if one appears before Chapter 1.
-
-    Example:
-
-    穿到史前就爱种田
-
-    第1章 初到异世界
-
-    ...
-
-    It detects:
-        穿到史前就爱种田
-
-    If there is no Chinese title before Chapter 1,
-    it returns an empty string.
-    """
-
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
-
-    if not lines:
-
-        return ""
-
-
-    # Look only at the beginning of the novel.
-    # Usually the title is within the first few lines.
-    for line in lines[:20]:
-
-        # Ignore obvious chapter headings.
-        if re.match(
-            r"(?i)^(第\s*\d+\s*[章节卷回]|chapter\s+\d+|chap\.\s*\d+)",
-            line
-        ):
-
-            break
-
-
-        # Remove common title labels.
-        cleaned = re.sub(
-            r"^(书名|小说名|作品名|标题)\s*[:：]\s*",
-            "",
-            line
-        ).strip()
-
-
-        # Must contain Chinese characters.
-        chinese_chars = re.findall(
-            r"[\u4e00-\u9fff]",
-            cleaned
-        )
-
-
-        if not chinese_chars:
-
-            continue
-
-
-        # A title should normally contain more than
-        # just one Chinese character.
-        if len(chinese_chars) >= 2:
-
-            # Avoid treating a sentence as the title.
-            # Titles generally don't end in Chinese punctuation.
-            if cleaned[-1:] in "。！？；，,!?;":
-
-                continue
-
-            return cleaned
-
-
-    return ""
-
-
-# =========================================================
-# REMOVE TITLE FROM NOVEL BODY
-# =========================================================
-
-def remove_detected_title(text, chinese_title):
-
-    if not chinese_title:
-
-        return text
-
-
-    lines = text.splitlines()
-
-    result = []
-
-    removed = False
-
-    for line in lines:
-
-        stripped = line.strip()
-
-        if not removed and stripped == chinese_title:
-
-            removed = True
-
-            continue
-
-        result.append(line)
-
-
-    return "\n".join(result).strip()
 
 
 # =========================================================
@@ -337,7 +361,7 @@ def split_text_into_chapters(text):
             matches = found
 
 
-    # If no chapter headings exist.
+    # No chapter headings.
     if not matches:
 
         return [
@@ -400,7 +424,7 @@ def split_text_into_chapters(text):
 
 
 # =========================================================
-# GEMINI TRANSLATION
+# GEMINI
 # =========================================================
 
 def translate_text(text):
@@ -423,7 +447,7 @@ RULES:
 - Translate everything.
 - Do not summarize.
 - Do not omit sentences.
-- Preserve the meaning.
+- Preserve the original meaning.
 - Preserve paragraph breaks.
 - Keep character names consistent.
 - Keep gender and pronouns consistent.
@@ -544,7 +568,7 @@ def translation_worker(novel_id):
         translated_words = 0
 
 
-        # Count already completed chapters.
+        # Count chapters already translated.
         for chapter in chapters:
 
             if (
@@ -564,7 +588,6 @@ def translation_worker(novel_id):
                 )
 
 
-        # Mark as translating.
         (
 
             supabase
@@ -592,7 +615,7 @@ def translation_worker(novel_id):
 
 
         # =================================================
-        # CHAPTER BY CHAPTER
+        # TRANSLATE CHAPTER BY CHAPTER
         # =================================================
 
         for chapter in chapters:
@@ -815,8 +838,11 @@ def translation_worker(novel_id):
 
 
 # =========================================================
-# DOWNLOAD CHECK
+# DOWNLOAD LIMIT
 # =========================================================
+
+DOWNLOAD_LIMIT = 30000
+
 
 def download_allowed(novel):
 
@@ -832,51 +858,14 @@ def download_allowed(novel):
     )
 
 
-    return translated_words >= DOWNLOAD_LIMIT
+    return (
+        translated_words
+        >= DOWNLOAD_LIMIT
+    )
 
 
 # =========================================================
-# DOWNLOAD TITLE
-# =========================================================
-
-def get_display_title(novel):
-
-    chinese_title = (
-        novel.get(
-            "chinese_title",
-            ""
-        )
-        or ""
-    ).strip()
-
-
-    english_title = (
-        novel.get(
-            "title",
-            ""
-        )
-        or ""
-    ).strip()
-
-
-    if chinese_title:
-
-        if english_title:
-
-            return (
-                chinese_title
-                + "\n"
-                + english_title
-            )
-
-        return chinese_title
-
-
-    return english_title
-
-
-# =========================================================
-# TXT DOWNLOAD
+# DOWNLOAD TXT
 # =========================================================
 
 @app.route(
@@ -884,6 +873,13 @@ def get_display_title(novel):
 )
 
 def download_txt(novel_id):
+
+    protection = login_required()
+
+    if protection:
+
+        return protection
+
 
     novel_result = (
 
@@ -926,50 +922,34 @@ def download_txt(novel_id):
     output = []
 
 
-    # Put title at beginning.
-    chinese_title = (
-        novel.get(
-            "chinese_title",
-            ""
-        )
-        or ""
-    ).strip()
+    # Add Chinese title first.
+    if novel.get("original_filename"):
+
+        filename_title = os.path.splitext(
+            novel["original_filename"]
+        )[0]
+
+    else:
+
+        filename_title = novel["title"]
 
 
-    english_title = (
-        novel.get(
-            "title",
-            ""
-        )
-        or ""
-    ).strip()
-
-
-    if chinese_title:
+    if contains_chinese(filename_title):
 
         output.append(
-            chinese_title
-        )
-
-        if english_title:
-
-            output.append(
-                english_title
-            )
-
-        output.append("")
-        output.append("")
-
-
-    elif english_title:
-
-        output.append(
-            "English Title: "
-            + english_title
+            filename_title
         )
 
         output.append("")
-        output.append("")
+
+
+    # English title.
+    output.append(
+        "English Title: "
+        + novel["title"]
+    )
+
+    output.append("")
 
 
     for chapter in chapters:
@@ -999,9 +979,7 @@ def download_txt(novel_id):
                 translated
             )
 
-            output.append(
-                "\n"
-            )
+            output.append("")
 
 
     content = "\n".join(
@@ -1036,7 +1014,7 @@ def download_txt(novel_id):
 
 
 # =========================================================
-# EPUB DOWNLOAD
+# DOWNLOAD EPUB
 # =========================================================
 
 @app.route(
@@ -1044,6 +1022,13 @@ def download_txt(novel_id):
 )
 
 def download_epub(novel_id):
+
+    protection = login_required()
+
+    if protection:
+
+        return protection
+
 
     novel_result = (
 
@@ -1113,24 +1098,6 @@ def download_epub(novel_id):
     # TITLE PAGE
     # =====================================================
 
-    chinese_title = (
-        novel.get(
-            "chinese_title",
-            ""
-        )
-        or ""
-    ).strip()
-
-
-    english_title = (
-        novel.get(
-            "title",
-            ""
-        )
-        or ""
-    ).strip()
-
-
     title_page = epub.EpubHtml(
 
         title="Title",
@@ -1142,6 +1109,21 @@ def download_epub(novel_id):
     )
 
 
+    filename_title = os.path.splitext(
+        novel.get(
+            "original_filename",
+            ""
+        )
+    )[0]
+
+
+    chinese_title = ""
+
+    if contains_chinese(filename_title):
+
+        chinese_title = filename_title
+
+
     title_html = ""
 
 
@@ -1149,48 +1131,22 @@ def download_epub(novel_id):
 
         title_html += (
             "<h1>"
-            + (
-                chinese_title
-                .replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-            )
+            + chinese_title
             + "</h1>"
         )
 
 
-        if english_title:
-
-            title_html += (
-                "<h2>"
-                + (
-                    english_title
-                    .replace("&", "&amp;")
-                    .replace("<", "&lt;")
-                    .replace(">", "&gt;")
-                )
-                + "</h2>"
-            )
-
-    else:
-
-        title_html += (
-            "<h1>"
-            + (
-                english_title
-                .replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-            )
-            + "</h1>"
-        )
+    title_html += (
+        "<h2>English Title: "
+        + novel["title"]
+        + "</h2>"
+    )
 
 
     title_page.content = f"""
     <html>
-
     <head>
-    <title>Title</title>
+    <title>{novel["title"]}</title>
     </head>
 
     <body>
@@ -1198,7 +1154,6 @@ def download_epub(novel_id):
     {title_html}
 
     </body>
-
     </html>
     """
 
@@ -1207,6 +1162,9 @@ def download_epub(novel_id):
         title_page
     )
 
+    epub_chapters.append(
+        title_page
+    )
 
     spine.append(
         title_page
@@ -1420,35 +1378,78 @@ def download_epub(novel_id):
 
 def delete_novel(novel_id):
 
+    protection = login_required()
+
+    if protection:
+
+        return protection
+
+
     try:
 
-        # Prefer service-role client if configured.
-        db = supabase_admin or supabase
+        # Delete chapters first because
+        # chapters reference novels.
+        (
+
+            supabase
+
+            .table("chapters")
+
+            .delete()
+
+            .eq(
+                "novel_id",
+                novel_id
+            )
+
+            .execute()
+
+        )
 
 
-        if not db:
+        # Delete translation batches if
+        # they reference the novel.
+        try:
 
-            return (
-                "Supabase is not configured."
-            ), 500
+            (
+
+                supabase
+
+                .table("translation_batches")
+
+                .delete()
+
+                .eq(
+                    "novel_id",
+                    novel_id
+                )
+
+                .execute()
+
+            )
+
+        except Exception:
+
+            pass
 
 
-        # Delete chapters first.
-        #
-        # This prevents problems if chapters.novel_id
-        # has a foreign-key relationship to novels.id.
+        # Delete novel.
+        (
 
-        db.table("chapters").delete().eq(
-            "novel_id",
-            novel_id
-        ).execute()
+            supabase
 
+            .table("novels")
 
-        # Then delete the novel.
-        db.table("novels").delete().eq(
-            "id",
-            novel_id
-        ).execute()
+            .delete()
+
+            .eq(
+                "id",
+                novel_id
+            )
+
+            .execute()
+
+        )
 
 
         return redirect("/")
@@ -1456,16 +1457,217 @@ def delete_novel(novel_id):
 
     except Exception as error:
 
-        print(
-            "DELETE ERROR:",
-            str(error)
+        return (
+            "Delete error: "
+            + str(error)
         )
 
 
-        return (
-            "Unable to delete novel: "
-            + str(error)
-        ), 500
+# =========================================================
+# LOGIN PAGE
+# =========================================================
+
+LOGIN_HTML = """
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
+
+<title>Novel Translator Login</title>
+
+
+<style>
+
+body {
+
+    font-family: Arial, sans-serif;
+
+    max-width: 500px;
+
+    margin: auto;
+
+    padding: 20px;
+
+    background: #f5f5f5;
+
+}
+
+
+.box {
+
+    background: white;
+
+    padding: 25px;
+
+    border-radius: 12px;
+
+    margin-top: 60px;
+
+}
+
+
+input {
+
+    width: 100%;
+
+    padding: 14px;
+
+    margin: 12px 0;
+
+    box-sizing: border-box;
+
+    border: 1px solid #ccc;
+
+    border-radius: 8px;
+
+}
+
+
+button {
+
+    width: 100%;
+
+    padding: 14px;
+
+    border: none;
+
+    border-radius: 8px;
+
+    background: #333;
+
+    color: white;
+
+    font-size: 16px;
+
+}
+
+
+.error {
+
+    background: #f8d7da;
+
+    padding: 12px;
+
+    border-radius: 8px;
+
+    margin-bottom: 10px;
+
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+<div class="box">
+
+<h1>🔐 Novel Translator</h1>
+
+<p>Enter your password to continue.</p>
+
+
+{% if error %}
+
+<div class="error">
+
+{{ error }}
+
+</div>
+
+{% endif %}
+
+
+<form method="POST"
+      action="/login">
+
+<input
+    type="password"
+    name="password"
+    placeholder="Password"
+    required
+>
+
+<button type="submit">
+
+Login
+
+</button>
+
+</form>
+
+</div>
+
+</body>
+
+</html>
+
+"""
+
+
+# =========================================================
+# LOGIN
+# =========================================================
+
+@app.route(
+    "/login",
+    methods=["GET", "POST"]
+)
+
+def login():
+
+    if request.method == "POST":
+
+        password = request.form.get(
+            "password",
+            ""
+        )
+
+
+        if (
+            SITE_PASSWORD
+            and password == SITE_PASSWORD
+        ):
+
+            session["logged_in"] = True
+
+            return redirect("/")
+
+
+        return render_template_string(
+
+            LOGIN_HTML,
+
+            error="Incorrect password."
+
+        )
+
+
+    return render_template_string(
+
+        LOGIN_HTML,
+
+        error=None
+
+    )
+
+
+# =========================================================
+# LOGOUT
+# =========================================================
+
+@app.route("/logout")
+def logout():
+
+    session.clear()
+
+    return redirect("/login")
 
 
 # =========================================================
@@ -1482,6 +1684,9 @@ HTML = """
 
 <meta name="viewport"
       content="width=device-width, initial-scale=1">
+
+<meta http-equiv="refresh"
+      content="10">
 
 <title>Novel Translator</title>
 
@@ -1530,8 +1735,6 @@ button {
 
     font-size: 16px;
 
-    cursor: pointer;
-
 }
 
 
@@ -1544,17 +1747,6 @@ input {
     margin: 10px 0;
 
     box-sizing: border-box;
-
-}
-
-
-label {
-
-    display: block;
-
-    margin-top: 12px;
-
-    font-weight: bold;
 
 }
 
@@ -1609,8 +1801,6 @@ label {
 
     margin-top: 12px;
 
-    text-decoration: none;
-
 }
 
 
@@ -1621,7 +1811,7 @@ label {
 }
 
 
-.delete-box {
+.delete {
 
     margin-top: 25px;
 
@@ -1632,20 +1822,27 @@ label {
 }
 
 
-.delete-button {
+.delete button {
 
-    background: #c62828;
+    background: #b00020;
 
     width: 100%;
 
 }
 
 
-.small {
+.logout {
 
-    font-size: 13px;
+    text-align: right;
 
-    color: #666;
+    margin-bottom: 15px;
+
+}
+
+
+.logout a {
+
+    color: #555;
 
 }
 
@@ -1657,6 +1854,13 @@ label {
 <body>
 
 
+<div class="logout">
+
+<a href="/logout">🔒 Logout</a>
+
+</div>
+
+
 <h1>📚 Novel Translator</h1>
 
 
@@ -1664,6 +1868,13 @@ label {
 
 
 <h2>Upload Novel</h2>
+
+<p>
+
+The Chinese and English title are detected
+automatically from the file.
+
+</p>
 
 
 <form method="POST"
@@ -1690,14 +1901,6 @@ Upload Novel
 
 
 </form>
-
-
-<p class="small">
-
-The Chinese title is detected automatically when
-one appears at the beginning of the novel.
-
-</p>
 
 
 </div>
@@ -1730,15 +1933,15 @@ one appears at the beginning of the novel.
 </h2>
 
 
-{% if novel.chinese_title %}
+{% if chinese_title %}
 
 <p>
 
-Chinese title:
+Chinese Title:
 
 <strong>
 
-{{ novel.chinese_title }}
+{{ chinese_title }}
 
 </strong>
 
@@ -1838,13 +2041,6 @@ Start Translation
 
 This page checks progress automatically.
 
-<br><br>
-
-You can close the browser.
-
-The translation runs on the server while the
-Render service remains running.
-
 </div>
 
 
@@ -1923,46 +2119,21 @@ Current translated words:
 {% endif %}
 
 
-<!-- DELETE -->
-
-<div class="delete-box">
-
-
-<h3>🗑️ Delete Novel</h3>
-
-
-<p class="small">
-
-After you have downloaded the TXT or EPUB,
-you can permanently remove this novel and its
-translations from the website.
-
-Your downloaded file on your phone will NOT be deleted.
-
-</p>
-
+<div class="delete">
 
 <form
     method="POST"
     action="/delete/{{ novel.id }}"
-    onsubmit="return confirm(
-        'Are you sure you want to permanently delete this novel and all of its translations? This cannot be undone.'
-    );"
+    onsubmit="return confirm('Delete this novel and all its translations? This cannot be undone.')"
 >
 
-
-<button
-    type="submit"
-    class="delete-button"
->
+<button type="submit">
 
 🗑️ Delete Novel
 
 </button>
 
-
 </form>
-
 
 </div>
 
@@ -1985,6 +2156,13 @@ Your downloaded file on your phone will NOT be deleted.
 
 @app.route("/")
 def home():
+
+    protection = login_required()
+
+    if protection:
+
+        return protection
+
 
     novel = None
 
@@ -2012,6 +2190,8 @@ def home():
 
 
     progress = 0
+
+    chinese_title = ""
 
 
     if novel:
@@ -2043,6 +2223,24 @@ def home():
             ) * 100
 
 
+        filename = novel.get(
+            "original_filename",
+            ""
+        )
+
+
+        filename_title = os.path.splitext(
+            filename
+        )[0]
+
+
+        if contains_chinese(
+            filename_title
+        ):
+
+            chinese_title = filename_title
+
+
     return render_template_string(
 
         HTML,
@@ -2050,6 +2248,8 @@ def home():
         novel=novel,
 
         message=message,
+
+        chinese_title=chinese_title,
 
         progress=min(
             progress,
@@ -2070,6 +2270,13 @@ def home():
 
 def upload():
 
+    protection = login_required()
+
+    if protection:
+
+        return protection
+
+
     if not supabase:
 
         return render_template_string(
@@ -2082,7 +2289,9 @@ def upload():
                 "Supabase is not configured."
             ),
 
-            progress=0
+            progress=0,
+
+            chinese_title=""
 
         )
 
@@ -2104,7 +2313,9 @@ def upload():
                 "Please choose a TXT or EPUB file."
             ),
 
-            progress=0
+            progress=0,
+
+            chinese_title=""
 
         )
 
@@ -2119,10 +2330,6 @@ def upload():
 
         file_bytes = uploaded_file.read()
 
-
-        # =================================================
-        # EXTRACT TEXT
-        # =================================================
 
         if filename.lower().endswith(
             ".txt"
@@ -2157,23 +2364,34 @@ def upload():
 
 
         # =================================================
-        # DETECT CHINESE TITLE
+        # AUTOMATIC TITLE DETECTION
         # =================================================
 
-        chinese_title = detect_chinese_title(
-            text,
-            filename
+        chinese_title, english_title = (
+            detect_titles(
+                text,
+                filename
+            )
         )
 
 
-        # Remove the Chinese title from the
-        # chapter text if it was detected.
-        if chinese_title:
+        # The database has one title field.
+        # We use the English title for the database title.
+        #
+        # If no English title was detected, use Chinese title.
+        if english_title:
 
-            text = remove_detected_title(
-                text,
-                chinese_title
-            )
+            title = english_title
+
+        elif chinese_title:
+
+            title = chinese_title
+
+        else:
+
+            title = os.path.splitext(
+                filename
+            )[0]
 
 
         # =================================================
@@ -2199,48 +2417,8 @@ def upload():
 
 
         # =================================================
-        # ENGLISH TITLE
-        # =================================================
-
-        english_title = os.path.splitext(
-            filename
-        )[0]
-
-
-        # =================================================
         # CREATE NOVEL
         # =================================================
-
-        novel_data = {
-
-            "title":
-                english_title,
-
-            "original_filename":
-                filename,
-
-            "total_words":
-                total_words,
-
-            "translated_words":
-                0,
-
-            "status":
-                "waiting"
-        }
-
-
-        # Add Chinese title only if it was detected.
-        #
-        # This requires the novels table to have
-        # a chinese_title column.
-
-        if chinese_title:
-
-            novel_data[
-                "chinese_title"
-            ] = chinese_title
-
 
         novel_result = (
 
@@ -2249,7 +2427,22 @@ def upload():
             .table("novels")
 
             .insert(
-                novel_data
+                {
+                    "title":
+                        title,
+
+                    "original_filename":
+                        filename,
+
+                    "total_words":
+                        total_words,
+
+                    "translated_words":
+                        0,
+
+                    "status":
+                        "waiting"
+                }
             )
 
             .execute()
@@ -2329,7 +2522,9 @@ def upload():
                 + str(error)
             ),
 
-            progress=0
+            progress=0,
+
+            chinese_title=""
 
         )
 
@@ -2343,6 +2538,13 @@ def upload():
 )
 
 def start_translation(novel_id):
+
+    protection = login_required()
+
+    if protection:
+
+        return protection
+
 
     if not supabase:
 
@@ -2457,4 +2659,4 @@ if __name__ == "__main__":
 
         port=port
 
-    )
+            )
