@@ -672,7 +672,7 @@ def translation_worker(novel_id):
 # DOWNLOAD HELPERS
 # =========================================================
 
-DOWNLOAD_LIMIT = 30000
+DOWNLOAD_LIMIT = 100
 
 
 def download_allowed(novel):
@@ -1363,7 +1363,7 @@ automatically.
 {% endif %}
 
 
-{% if novel.translated_words >= 30000 %}
+{% if novel.translated_words >= 100 %}
 
 <hr>
 
