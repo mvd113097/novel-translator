@@ -40,7 +40,12 @@ app.secret_key = os.environ.get(
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY")
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# NEW:
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+
 SITE_PASSWORD = os.environ.get("SITE_PASSWORD")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -67,6 +72,19 @@ if GEMINI_API_KEY:
 
 
 # =========================================================
+# MODEL SETTINGS
+# =========================================================
+
+# Primary model
+GEMINI_MODEL = "gemini-3.6-flash"
+
+# Fallback model
+OPENROUTER_MODEL = (
+    "qwen/qwen3-235b-a22b-2507:free"
+)
+
+
+# =========================================================
 # TRANSLATION CONTROL
 # =========================================================
 
@@ -79,25 +97,33 @@ current_translation_novel = None
 # BATCH SETTINGS
 # =========================================================
 
-# Approximate maximum amount of Chinese text sent to Gemini
-# in one request.
+# Maximum Chinese characters sent in one translation request.
 #
-# This is CHARACTER based because Chinese does not use
-# spaces between words the same way English does.
+# We deliberately do NOT use the full model context window.
 #
-# 20,000 characters is approximately a 20k-Chinese-character
-# batch, NOT a 20k-English-word requirement.
+# Smaller batches are safer because:
 #
-# If a single chapter is larger than this, it is translated
-# separately instead of being combined with other chapters.
-BATCH_MAX_CHARS = 20000
+# - translated English can be longer
+# - prompts add tokens
+# - chapter markers add tokens
+# - very large responses are more likely to fail
+#
+# 30,000 Chinese characters is a good starting point.
+#
+# If testing shows the models handle it comfortably, this can
+# later be increased.
+BATCH_MAX_CHARS = 30000
 
 
-# Small delay between successful API requests.
-#
-# This is deliberately short because the main purpose of
-# batching is to reduce the number of requests.
+# Delay after successful request.
 BATCH_DELAY = 1
+
+
+# =========================================================
+# HTTP SETTINGS
+# =========================================================
+
+OPENROUTER_TIMEOUT = 600
 
 
 # =========================================================
@@ -328,19 +354,16 @@ def count_words(text):
     if not text:
         return 0
 
-    # English / space-separated words
     english_words = re.findall(
         r"\b[\w'-]+\b",
         text
     )
 
-    # Chinese characters
     chinese_chars = re.findall(
         r"[\u4e00-\u9fff]",
         text
     )
 
-    # For Chinese novels, character count is more useful.
     if chinese_chars:
 
         return len(chinese_chars)
@@ -349,7 +372,7 @@ def count_words(text):
 
 
 # =========================================================
-# TITLE DETECTION
+# CHINESE DETECTION
 # =========================================================
 
 def contains_chinese(text):
@@ -361,6 +384,10 @@ def contains_chinese(text):
         )
     )
 
+
+# =========================================================
+# CHAPTER HEADING
+# =========================================================
 
 def is_chapter_heading(text):
 
@@ -389,6 +416,10 @@ def is_chapter_heading(text):
 
     return False
 
+
+# =========================================================
+# TITLE DETECTION
+# =========================================================
 
 def detect_titles(text, filename):
 
@@ -509,7 +540,6 @@ def extract_epub(file_bytes):
 
     for item in book.get_items():
 
-        # ebooklib ITEM_DOCUMENT = 9
         if item.get_type() == 9:
 
             soup = BeautifulSoup(
@@ -659,11 +689,9 @@ def create_translation_batches(chapters):
 
 
         # -------------------------------------------------
-        # Very large chapter
+        # LARGE CHAPTER
         # -------------------------------------------------
-        #
-        # We cannot safely combine it with other chapters.
-        #
+
         if chapter_chars > BATCH_MAX_CHARS:
 
             if current_batch:
@@ -676,6 +704,7 @@ def create_translation_batches(chapters):
                 current_chars = 0
 
 
+            # A large chapter gets its own request.
             batches.append(
                 [chapter]
             )
@@ -684,7 +713,7 @@ def create_translation_batches(chapters):
 
 
         # -------------------------------------------------
-        # Would this chapter exceed the batch size?
+        # WOULD EXCEED BATCH SIZE
         # -------------------------------------------------
 
         if (
@@ -720,78 +749,113 @@ def create_translation_batches(chapters):
 
 
 # =========================================================
-# GEMINI ERROR HELPERS
+# ERROR HELPERS
 # =========================================================
+
+def error_text(error):
+
+    try:
+
+        return str(error)
+
+    except Exception:
+
+        return repr(error)
+
 
 def is_quota_error(error):
 
-    text = str(error).lower()
+    text = error_text(
+        error
+    ).lower()
 
-    return (
-        "429" in text
-        or "quota exceeded" in text
-        or "too many requests" in text
-        or "generate_content_free_tier_requests" in text
+
+    patterns = [
+
+        "429",
+
+        "quota exceeded",
+
+        "too many requests",
+
+        "rate limit",
+
+        "rate_limit",
+
+        "resource exhausted",
+
+        "generate_content_free_tier_requests",
+
+        "free-models-per-day",
+
+        "free model rate limit",
+
+        "requests per day",
+
+        "requests per minute"
+
+    ]
+
+
+    return any(
+        pattern in text
+        for pattern in patterns
     )
 
 
 def get_retry_seconds(error):
 
-    text = str(error)
-
-
-    # Examples:
-    #
-    # "Please retry in 39.308244323s."
-    # "Please retry in 51.645057992s."
-
-    match = re.search(
-        r"retry in\s+([0-9]+(?:\.[0-9]+)?)s",
-        text,
-        re.IGNORECASE
+    text = error_text(
+        error
     )
 
 
-    if match:
+    patterns = [
 
-        try:
+        r"retry in\s+([0-9]+(?:\.[0-9]+)?)s",
 
-            seconds = float(
-                match.group(1)
-            )
+        r"retry-after[\"']?\s*[:=]\s*[\"']?([0-9]+)",
 
-            return max(
-                1,
-                int(seconds) + 2
-            )
+        r"try again in\s+([0-9]+(?:\.[0-9]+)?)s"
 
-        except Exception:
+    ]
 
-            pass
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+
+        if match:
+
+            try:
+
+                return max(
+                    1,
+                    int(
+                        float(
+                            match.group(1)
+                        )
+                    ) + 2
+                )
+
+            except Exception:
+
+                pass
 
 
     return 60
 
 
 # =========================================================
-# GEMINI BATCH TRANSLATION
+# TRANSLATION PROMPT
 # =========================================================
 
-def translate_batch(batch):
-
-    if not gemini:
-
-        raise RuntimeError(
-            "Gemini API key is not configured."
-        )
-
-
-    # -----------------------------------------------------
-    # Create numbered sections.
-    #
-    # The markers allow us to separate the translation
-    # back into the individual chapters.
-    # -----------------------------------------------------
+def build_translation_prompt(batch):
 
     sections = []
 
@@ -828,6 +892,8 @@ You are a professional Chinese-to-English web-novel translator.
 
 Translate EVERY chapter below into natural, fluent English.
 
+This is a literary translation, not a summary.
+
 IMPORTANT RULES:
 
 1. Translate everything.
@@ -839,28 +905,34 @@ IMPORTANT RULES:
 7. Keep character names consistent.
 8. Keep genders and pronouns consistent.
 9. Keep dialogue natural.
-10. Do not add explanations.
-11. Do not add translator notes.
-12. Do not combine chapters.
-13. Do not change chapter order.
-14. Output ONLY the translations.
-15. You MUST preserve every START and END marker exactly.
-16. Do not translate or modify the markers.
+10. Preserve humor and sarcasm.
+11. Translate Chinese internet slang naturally into English.
+12. Preserve jokes and wordplay as naturally as possible.
+13. Do not add explanations.
+14. Do not add translator notes.
+15. Do not combine chapters.
+16. Do not change chapter order.
+17. Output ONLY the translations.
+18. Preserve every START and END marker exactly.
+19. Do not translate or modify the markers.
+20. Do not invent content.
+21. Do not shorten the story.
+22. Internal thoughts enclosed in [ ] should remain clearly recognizable as thoughts.
+23. Keep the same paragraph structure whenever practical.
 
-The markers are used by the program to separate the chapters after
-translation.
+The markers are used by the program to separate the chapters after translation.
 
-Return the result in exactly this structure:
+Return EXACTLY this structure:
 
 <<<CHAPTER_1_START>>>
-English translation of chapter 1
+English translation
 <<<CHAPTER_1_END>>>
 
 <<<CHAPTER_2_START>>>
-English translation of chapter 2
+English translation
 <<<CHAPTER_2_END>>>
 
-Continue this way for every chapter in the request.
+Continue this way for every chapter.
 
 TEXT TO TRANSLATE:
 
@@ -868,8 +940,30 @@ TEXT TO TRANSLATE:
 """
 
 
+    return prompt
+
+
+# =========================================================
+# GEMINI TRANSLATION
+# =========================================================
+
+def translate_with_gemini(prompt):
+
+    if not gemini:
+
+        raise RuntimeError(
+            "Gemini API key is not configured."
+        )
+
+
+    print(
+        "Using Gemini:",
+        GEMINI_MODEL
+    )
+
+
     interaction = gemini.interactions.create(
-        model="gemini-3.6-flash",
+        model=GEMINI_MODEL,
         input=prompt
     )
 
@@ -885,6 +979,270 @@ TEXT TO TRANSLATE:
 
 
     return result.strip()
+
+
+# =========================================================
+# OPENROUTER TRANSLATION
+# =========================================================
+
+def translate_with_openrouter(prompt):
+
+    if not OPENROUTER_API_KEY:
+
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not configured."
+        )
+
+
+    print(
+        "Using OpenRouter:",
+        OPENROUTER_MODEL
+    )
+
+
+    response = requests.post(
+
+        "https://openrouter.ai/api/v1/chat/completions",
+
+        headers={
+            "Authorization":
+                "Bearer "
+                + OPENROUTER_API_KEY,
+
+            "Content-Type":
+                "application/json",
+
+            "HTTP-Referer":
+                os.environ.get(
+                    "APP_URL",
+                    "https://localhost"
+                ),
+
+            "X-Title":
+                "Novel Translator"
+        },
+
+        json={
+
+            "model":
+                OPENROUTER_MODEL,
+
+            "messages": [
+
+                {
+                    "role":
+                        "user",
+
+                    "content":
+                        prompt
+                }
+
+            ],
+
+            "temperature":
+                0.2,
+
+            "max_tokens":
+                65536
+
+        },
+
+        timeout=OPENROUTER_TIMEOUT
+
+    )
+
+
+    if response.status_code != 200:
+
+        raise RuntimeError(
+            "OpenRouter HTTP "
+            + str(response.status_code)
+            + ": "
+            + response.text[:3000]
+        )
+
+
+    try:
+
+        data = response.json()
+
+    except Exception:
+
+        raise RuntimeError(
+            "OpenRouter returned invalid JSON."
+        )
+
+
+    choices = data.get(
+        "choices",
+        []
+    )
+
+
+    if not choices:
+
+        raise RuntimeError(
+            "OpenRouter returned no choices."
+        )
+
+
+    message = choices[0].get(
+        "message",
+        {}
+    )
+
+
+    result = message.get(
+        "content",
+        ""
+    )
+
+
+    if isinstance(
+        result,
+        list
+    ):
+
+        result = "".join(
+
+            part.get(
+                "text",
+                ""
+            )
+
+            if isinstance(
+                part,
+                dict
+            )
+
+            else str(part)
+
+            for part in result
+
+        )
+
+
+    if not result:
+
+        raise RuntimeError(
+            "OpenRouter returned an empty translation."
+        )
+
+
+    return result.strip()
+
+
+# =========================================================
+# BATCH TRANSLATION WITH FALLBACK
+# =========================================================
+
+def translate_batch(batch):
+
+    prompt = build_translation_prompt(
+        batch
+    )
+
+
+    # =====================================================
+    # TRY GEMINI FIRST
+    # =====================================================
+
+    if gemini:
+
+        try:
+
+            result = translate_with_gemini(
+                prompt
+            )
+
+            return result, "Gemini"
+
+
+        except Exception as gemini_error:
+
+            print(
+                "Gemini error:",
+                error_text(
+                    gemini_error
+                )
+            )
+
+
+            # ---------------------------------------------
+            # ONLY FALL BACK TO QWEN FOR QUOTA / RATE LIMIT
+            # ---------------------------------------------
+
+            if not is_quota_error(
+                gemini_error
+            ):
+
+                # A normal Gemini error should still try
+                # Qwen once, because Qwen can potentially
+                # complete the request successfully.
+                print(
+                    "Gemini failed for a non-quota reason."
+                )
+
+            else:
+
+                print(
+                    "Gemini quota/rate limit detected."
+                )
+
+
+            if OPENROUTER_API_KEY:
+
+                try:
+
+                    result = translate_with_openrouter(
+                        prompt
+                    )
+
+                    return result, "Qwen"
+
+
+                except Exception as qwen_error:
+
+                    print(
+                        "Qwen error:",
+                        error_text(
+                            qwen_error
+                        )
+                    )
+
+                    raise RuntimeError(
+
+                        "Gemini failed:\n"
+                        + error_text(
+                            gemini_error
+                        )
+                        + "\n\n"
+                        + "Qwen failed:\n"
+                        + error_text(
+                            qwen_error
+                        )
+
+                    )
+
+            raise
+
+
+    # =====================================================
+    # NO GEMINI → USE QWEN
+    # =====================================================
+
+    if OPENROUTER_API_KEY:
+
+        result = translate_with_openrouter(
+            prompt
+        )
+
+        return result, "Qwen"
+
+
+    raise RuntimeError(
+        "Neither Gemini nor OpenRouter is configured."
+    )
 
 
 # =========================================================
@@ -921,7 +1279,7 @@ def parse_batch_translation(
         if start_position == -1:
 
             raise RuntimeError(
-                "Gemini did not return the expected "
+                "Translation did not contain expected "
                 + f"start marker for chapter {number}."
             )
 
@@ -941,7 +1299,7 @@ def parse_batch_translation(
         if end_position == -1:
 
             raise RuntimeError(
-                "Gemini did not return the expected "
+                "Translation did not contain expected "
                 + f"end marker for chapter {number}."
             )
 
@@ -954,8 +1312,8 @@ def parse_batch_translation(
         if not content:
 
             raise RuntimeError(
-                f"Gemini returned an empty translation "
-                f"for chapter {number}."
+                "Empty translation for chapter "
+                + str(number)
             )
 
 
@@ -967,8 +1325,8 @@ def parse_batch_translation(
     if len(translations) != len(batch):
 
         raise RuntimeError(
-            "The number of translated chapters does not "
-            "match the number of chapters sent."
+            "Translated chapter count does not "
+            "match batch chapter count."
         )
 
 
@@ -1039,6 +1397,10 @@ def translation_worker(novel_id):
         blocking=False
     ):
 
+        print(
+            "Another translation is already running."
+        )
+
         return
 
 
@@ -1053,7 +1415,7 @@ def translation_worker(novel_id):
 
 
         # -------------------------------------------------
-        # Count already completed chapters
+        # COUNT ALREADY COMPLETED CHAPTERS
         # -------------------------------------------------
 
         translated_words = 0
@@ -1061,7 +1423,10 @@ def translation_worker(novel_id):
 
         for chapter in chapters:
 
-            if chapter.get("status") == "translated":
+            if (
+                chapter.get("status")
+                == "translated"
+            ):
 
                 translated_words += (
 
@@ -1075,7 +1440,7 @@ def translation_worker(novel_id):
 
 
         # -------------------------------------------------
-        # Update novel status
+        # MARK TRANSLATING
         # -------------------------------------------------
 
         (
@@ -1083,8 +1448,11 @@ def translation_worker(novel_id):
             .table("novels")
             .update(
                 {
-                    "status": "translating",
-                    "translated_words": translated_words
+                    "status":
+                        "translating",
+
+                    "translated_words":
+                        translated_words
                 }
             )
             .eq(
@@ -1096,7 +1464,7 @@ def translation_worker(novel_id):
 
 
         # -------------------------------------------------
-        # Only unfinished chapters
+        # ONLY UNFINISHED CHAPTERS
         # -------------------------------------------------
 
         remaining = []
@@ -1104,7 +1472,11 @@ def translation_worker(novel_id):
 
         for chapter in chapters:
 
-            if chapter.get("status") == "translated":
+            if (
+                chapter.get("status")
+                == "translated"
+            ):
+
                 continue
 
 
@@ -1118,6 +1490,7 @@ def translation_worker(novel_id):
 
 
             if not original.strip():
+
                 continue
 
 
@@ -1127,7 +1500,35 @@ def translation_worker(novel_id):
 
 
         # -------------------------------------------------
-        # Create batches
+        # NOTHING LEFT
+        # -------------------------------------------------
+
+        if not remaining:
+
+            (
+                supabase
+                .table("novels")
+                .update(
+                    {
+                        "status":
+                            "completed",
+
+                        "translated_words":
+                            translated_words
+                    }
+                )
+                .eq(
+                    "id",
+                    novel_id
+                )
+                .execute()
+            )
+
+            return
+
+
+        # -------------------------------------------------
+        # CREATE BATCHES
         # -------------------------------------------------
 
         batches = create_translation_batches(
@@ -1187,16 +1588,24 @@ def translation_worker(novel_id):
             try:
 
                 # -------------------------------------------------
-                # ONE GEMINI REQUEST FOR THE WHOLE BATCH
+                # TRANSLATE
                 # -------------------------------------------------
 
-                translated_batch = translate_batch(
-                    batch
+                translated_batch, model_used = (
+                    translate_batch(
+                        batch
+                    )
+                )
+
+
+                print(
+                    "Batch translated using:",
+                    model_used
                 )
 
 
                 # -------------------------------------------------
-                # Separate translations
+                # PARSE
                 # -------------------------------------------------
 
                 translations = parse_batch_translation(
@@ -1206,7 +1615,13 @@ def translation_worker(novel_id):
 
 
                 # -------------------------------------------------
-                # SAVE EACH CHAPTER IMMEDIATELY
+                # IMPORTANT:
+                #
+                # We only start saving AFTER the entire batch
+                # has successfully returned AND parsed.
+                #
+                # Therefore a malformed/partial response does
+                # not mark chapters as translated.
                 # -------------------------------------------------
 
                 for chapter, translated in zip(
@@ -1224,9 +1639,14 @@ def translation_worker(novel_id):
                         .table("chapters")
                         .update(
                             {
-                                "translated_text": translated,
-                                "translated_words": words,
-                                "status": "translated"
+                                "translated_text":
+                                    translated,
+
+                                "translated_words":
+                                    words,
+
+                                "status":
+                                    "translated"
                             }
                         )
                         .eq(
@@ -1240,7 +1660,10 @@ def translation_worker(novel_id):
                     translated_words += words
 
 
-                    # Save total progress after EVERY chapter.
+                    # -------------------------------------------------
+                    # SAVE TOTAL AFTER EVERY CHAPTER
+                    # -------------------------------------------------
+
                     (
                         supabase
                         .table("novels")
@@ -1248,6 +1671,7 @@ def translation_worker(novel_id):
                             {
                                 "translated_words":
                                     translated_words,
+
                                 "status":
                                     "translating"
                             }
@@ -1265,13 +1689,16 @@ def translation_worker(novel_id):
                         chapter["chapter_number"],
                         "-",
                         words,
-                        "translated words."
+                        "translated words",
+                        "- model:",
+                        model_used
                     )
 
 
                 print(
                     f"Completed batch {batch_number}/"
                     f"{len(batches)}"
+                    f" using {model_used}"
                 )
 
 
@@ -1281,10 +1708,6 @@ def translation_worker(novel_id):
                 gc.collect()
 
 
-                # -------------------------------------------------
-                # Small delay between API requests
-                # -------------------------------------------------
-
                 time.sleep(
                     BATCH_DELAY
                 )
@@ -1292,14 +1715,19 @@ def translation_worker(novel_id):
 
             except Exception as error:
 
+                error_message = error_text(
+                    error
+                )
+
+
                 print(
                     "TRANSLATION ERROR:",
-                    str(error)
+                    error_message
                 )
 
 
                 # =================================================
-                # GEMINI 429
+                # QUOTA / RATE LIMIT
                 # =================================================
 
                 if is_quota_error(error):
@@ -1318,6 +1746,7 @@ def translation_worker(novel_id):
                                 {
                                     "status":
                                         "paused",
+
                                     "translated_words":
                                         translated_words
                                 }
@@ -1334,23 +1763,25 @@ def translation_worker(novel_id):
                         pass
 
 
-                    message = (
-                        "⏸️ TRANSLATION PAUSED\n\n"
-                        "Gemini's free-tier quota/rate limit "
-                        "has been reached.\n\n"
-                        "Completed chapters were saved safely.\n\n"
-                        f"Gemini asked the app to retry in "
-                        f"about {retry_seconds} seconds.\n\n"
-                        "The translator has stopped making "
-                        "requests instead of repeatedly "
-                        "hitting the quota.\n\n"
-                        "Press \"Resume Translation\" later "
-                        "to continue."
-                    )
-
-
                     send_telegram(
-                        message
+
+                        "⏸️ TRANSLATION PAUSED\n\n"
+
+                        "Both available translation paths "
+                        "are currently rate-limited or unavailable.\n\n"
+
+                        "Completed chapters were saved safely.\n\n"
+
+                        f"Suggested retry time: about "
+                        f"{retry_seconds} seconds.\n\n"
+
+                        "Press Resume Translation later. "
+                        "Already completed chapters will "
+                        "NOT be translated again.\n\n"
+
+                        f"Translated words: "
+                        f"{translated_words:,}"
+
                     )
 
 
@@ -1358,7 +1789,7 @@ def translation_worker(novel_id):
 
 
                 # =================================================
-                # OTHER TRANSLATION ERROR
+                # OTHER ERROR
                 # =================================================
 
                 try:
@@ -1370,6 +1801,7 @@ def translation_worker(novel_id):
                             {
                                 "status":
                                     "paused",
+
                                 "translated_words":
                                     translated_words
                             }
@@ -1387,14 +1819,21 @@ def translation_worker(novel_id):
 
 
                 send_telegram(
+
                     "🔴 TRANSLATION STOPPED\n\n"
-                    "Gemini returned an error while "
-                    "translating.\n\n"
-                    f"Error:\n{str(error)[:1000]}\n\n"
+
+                    "An unexpected translation error occurred.\n\n"
+
+                    f"Error:\n"
+                    f"{error_message[:1500]}\n\n"
+
                     f"Translated words: "
                     f"{translated_words:,}\n\n"
+
                     "Completed chapters were saved.\n"
-                    "Press \"Resume Translation\" to continue."
+
+                    "Press Resume Translation to continue."
+
                 )
 
 
@@ -1402,7 +1841,7 @@ def translation_worker(novel_id):
 
 
         # =================================================
-        # ALL CHAPTERS FINISHED
+        # ALL FINISHED
         # =================================================
 
         (
@@ -1412,6 +1851,7 @@ def translation_worker(novel_id):
                 {
                     "translated_words":
                         translated_words,
+
                     "status":
                         "completed"
                 }
@@ -1425,18 +1865,27 @@ def translation_worker(novel_id):
 
 
         send_telegram(
+
             "✅ TRANSLATION COMPLETE!\n\n"
+
             "The novel has finished translating.\n\n"
+
             "Translated words: "
             + f"{translated_words:,}"
+
         )
 
 
     except Exception as error:
 
+        error_message = error_text(
+            error
+        )
+
+
         print(
             "WORKER ERROR:",
-            str(error)
+            error_message
         )
 
 
@@ -1464,10 +1913,18 @@ def translation_worker(novel_id):
 
 
         send_telegram(
+
             "🔴 TRANSLATION WORKER STOPPED\n\n"
+
             "The translation worker stopped unexpectedly.\n\n"
-            "Completed chapters were saved.\n\n"
-            "Press \"Resume Translation\" to continue."
+
+            f"Error:\n"
+            f"{error_message[:1500]}\n\n"
+
+            "Completed chapters were saved.\n"
+
+            "Press Resume Translation to continue."
+
         )
 
 
@@ -1631,10 +2088,6 @@ def download_txt(novel_id):
         return "Novel not found.", 404
 
 
-    # -----------------------------------------------------
-    # DOWNLOAD IS ALLOWED AFTER ONLY ONE COMPLETED CHAPTER
-    # -----------------------------------------------------
-
     if not download_allowed(
         novel_id
     ):
@@ -1674,10 +2127,6 @@ def download_txt(novel_id):
 
     output.append("")
 
-
-    # -----------------------------------------------------
-    # ONLY COMPLETED CHAPTERS
-    # -----------------------------------------------------
 
     for chapter in chapters:
 
@@ -1882,11 +2331,9 @@ def download_epub(novel_id):
     <head>
     <title>{safe_english}</title>
     </head>
-
     <body>
     {title_html}
     </body>
-
     </html>
     """
 
@@ -1907,7 +2354,7 @@ def download_epub(novel_id):
 
 
     # =====================================================
-    # COMPLETED CHAPTERS ONLY
+    # COMPLETED CHAPTERS
     # =====================================================
 
     for chapter in chapters:
@@ -2002,21 +2449,13 @@ def download_epub(novel_id):
 
         c.content = f"""
         <html>
-
         <head>
-
         <title>{safe_title}</title>
-
         </head>
-
         <body>
-
         <h1>{safe_title}</h1>
-
         {html}
-
         </body>
-
         </html>
         """
 
@@ -2271,6 +2710,14 @@ input {
     border-radius: 8px;
 }
 
+.model {
+    background: #f0f0f0;
+    padding: 10px;
+    border-radius: 8px;
+    margin-top: 10px;
+    font-size: 14px;
+}
+
 </style>
 
 </head>
@@ -2293,9 +2740,6 @@ input {
 <p>
 
 The title is detected automatically from the file.
-
-If a Chinese title is found, it will appear before
-the English title in the downloaded TXT and EPUB.
 
 </p>
 
@@ -2435,14 +2879,16 @@ Status:
 
 <br><br>
 
-If Gemini's quota was reached, completed chapters
-are already saved safely.
+The translator has stopped making requests
+instead of repeatedly hitting the API limits.
 
 <br><br>
 
-You can press Resume Translation later.
-The translator will skip chapters that are
-already complete.
+Completed chapters are already saved safely.
+
+<br><br>
+
+Press Resume Translation to continue.
 
 </div>
 
@@ -2476,8 +2922,15 @@ already complete.
 
 <br><br>
 
+Gemini is used first.
+
+If Gemini reaches a quota/rate limit,
+the app automatically tries Qwen through OpenRouter.
+
+<br><br>
+
 Multiple small chapters are combined into larger
-Gemini requests to reduce the number of API requests.
+requests to reduce the number of API requests.
 
 <br><br>
 
@@ -2485,8 +2938,23 @@ Completed chapters are saved immediately.
 
 <br><br>
 
-You can download completed chapters while
-the rest of the novel continues translating.
+You can close your browser while translation continues.
+
+<br><br>
+
+You can also download completed chapters while
+the remaining chapters continue translating.
+
+</div>
+
+
+<div class="model">
+
+Primary: Gemini
+
+<br>
+
+Fallback: Qwen3 235B A22B Instruct 2507
 
 </div>
 
@@ -2521,8 +2989,8 @@ words before downloading.
 <br><br>
 
 As soon as the first chapter from a successfully
-translated batch is saved, the TXT and EPUB
-download buttons become available.
+translated batch is saved, the download buttons
+become available.
 
 <br><br>
 
@@ -2850,10 +3318,6 @@ def upload():
             )
 
 
-        # =================================================
-        # TITLE
-        # =================================================
-
         chinese_title, english_title = detect_titles(
             text,
             filename
@@ -2875,10 +3339,6 @@ def upload():
             )[0]
 
 
-        # =================================================
-        # CHAPTERS
-        # =================================================
-
         chapters = split_text_into_chapters(
             text
         )
@@ -2894,10 +3354,6 @@ def upload():
 
         )
 
-
-        # =================================================
-        # CREATE NOVEL
-        # =================================================
 
         novel_result = (
 
@@ -2928,10 +3384,6 @@ def upload():
 
         novel = novel_result.data[0]
 
-
-        # =================================================
-        # SAVE CHAPTERS
-        # =================================================
 
         for chapter in chapters:
 
@@ -2977,18 +3429,18 @@ def upload():
         gc.collect()
 
 
-        # =================================================
-        # TELEGRAM
-        # =================================================
-
         send_telegram(
+
             "📚 NOVEL UPLOADED\n\n"
             + title
             + "\n\n"
             + "Original words: "
             + f"{total_words:,}"
             + "\n\n"
+            + "Gemini → Qwen fallback enabled."
+            + "\n\n"
             + "Press Start Translation on the website."
+
         )
 
 
@@ -3056,10 +3508,6 @@ def start_translation(novel_id):
         ]
 
 
-        # -------------------------------------------------
-        # Nothing left to translate
-        # -------------------------------------------------
-
         if not remaining:
 
             (
@@ -3082,18 +3530,10 @@ def start_translation(novel_id):
             return redirect("/")
 
 
-        # -------------------------------------------------
-        # Prevent duplicate workers
-        # -------------------------------------------------
-
         if translation_lock.locked():
 
             return redirect("/")
 
-
-        # -------------------------------------------------
-        # Start background worker
-        # -------------------------------------------------
 
         thread = threading.Thread(
 
