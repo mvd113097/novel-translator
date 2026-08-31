@@ -89,7 +89,7 @@ TELEGRAM_CHAT_ID = os.environ.get(
 # MODEL CONFIGURATION
 # ============================================================
 
-# High-speed production model that stays within Google's free tier
+# Standard production model to avoid 404 errors completely
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
     "gemini-2.5-flash"
@@ -99,18 +99,19 @@ OPENROUTER_FREE_ROUTER = "openrouter/free"
 
 
 # ============================================================
-# TRANSLATION SETTINGS (MAXIMIZED FOR SPEED & STABILITY)
+# TRANSLATION SETTINGS (OPTIMIZED FOR STABILITY & ZERO HANGS)
 # ============================================================
 
-# Maximize chunk size so fewer API calls are needed to complete the novel
-MAX_CHARS_PER_REQUEST = 20000
+# 10,000 characters prevents openrouter payload timeouts while remaining fast
+MAX_CHARS_PER_REQUEST = 10000
 
-# Optimal delay (seconds) to respect Gemini free limits (10 RPM) & stop 503 spikes
-REQUEST_DELAY = 5.0
+# 3.0-second delay keeps Gemini safely under the 10 RPM rate limit
+REQUEST_DELAY = 3.0
 
 MAX_RETRIES = 5
 
-OPENROUTER_TIMEOUT = 45
+# Short timeout so stuck free OpenRouter models skip quickly
+OPENROUTER_TIMEOUT = 20
 
 GEMINI_TIMEOUT = 120
 
@@ -447,15 +448,15 @@ hr {
         <strong>Translation System (Speed Optimized & 100% Free)</strong>
 
         <p>
-            1. Gemini 2.5 Flash is tried first for top speed and minimal quota limits.
+            1. Gemini 2.5 Flash runs first for high speed and stability.
         </p>
 
         <p>
-            2. Large 20k character chunks speed up processing.
+            2. 10k character chunks prevent payload timeouts.
         </p>
 
         <p>
-            3. Instant EPUB download unlocks as soon as the first English text translates.
+            3. EPUB download unlocks as soon as the first English text translates.
         </p>
 
         <p>
@@ -1279,7 +1280,7 @@ def translate_with_gemini(text):
 
             if attempt < MAX_RETRIES - 1:
                 if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    sleep_time = (2 ** attempt) * 4
+                    sleep_time = (2 ** attempt) * 3
                     print(f"Gemini server load spike. Retrying in {sleep_time} seconds...")
                     time.sleep(sleep_time)
                 else:
