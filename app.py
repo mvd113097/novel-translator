@@ -7,6 +7,7 @@ import threading
 import zipfile
 import html
 import secrets
+import requests
 
 from flask import (
     Flask,
@@ -17,8 +18,6 @@ from flask import (
     send_file,
     session
 )
-
-import requests
 
 from google import genai
 from google.genai import types
@@ -32,7 +31,7 @@ app = Flask(__name__)
 
 app.secret_key = os.environ.get(
     "FLASK_SECRET_KEY",
-    "super-secret-key-change-this-in-render"
+    "change-this-secret-key"
 )
 
 app.config["SESSION_COOKIE_SECURE"] = True
@@ -65,17 +64,20 @@ SITE_PASSWORD = os.environ.get(
 SUPABASE_URL = os.environ.get(
     "SUPABASE_URL",
     ""
-).strip().rstrip("/")
+).strip()
 
-SUPABASE_PUBLISHABLE_KEY = os.environ.get(
-    "SUPABASE_PUBLISHABLE_KEY",
+# New Supabase secret key.
+# We also support the old service_role variable name.
+SUPABASE_SECRET_KEY = os.environ.get(
+    "SUPABASE_SECRET_KEY",
     ""
 ).strip()
 
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
-    "SUPABASE_SERVICE_ROLE_KEY",
-    ""
-).strip()
+if not SUPABASE_SECRET_KEY:
+    SUPABASE_SECRET_KEY = os.environ.get(
+        "SUPABASE_SERVICE_ROLE_KEY",
+        ""
+    ).strip()
 
 TELEGRAM_BOT_TOKEN = os.environ.get(
     "TELEGRAM_BOT_TOKEN",
@@ -106,8 +108,12 @@ MAX_CHARS_PER_REQUEST = 10000
 REQUEST_DELAY = 3.0
 MAX_RETRIES = 5
 
-OPENROUTER_TIMEOUT = 30
+OPENROUTER_TIMEOUT = 60
 GEMINI_TIMEOUT = 120
+
+SUPABASE_TIMEOUT = 30
+
+TELEGRAM_TIMEOUT = 15
 
 
 # ============================================================
@@ -133,25 +139,14 @@ if GEMINI_API_KEY:
 
 
 # ============================================================
-# IN-MEMORY CACHE
+# IN-MEMORY JOB CACHE
 # ============================================================
 
 jobs = {}
 jobs_lock = threading.Lock()
 
-
-# ============================================================
-# OPENROUTER FREE MODELS
-# ============================================================
-
-FREE_FALLBACK_MODELS = [
-    "deepseek/deepseek-r1:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "nvidia/nemotron-3-nano-30b-a3b:free",
-    "google/gemma-4-31b:free",
-    "openrouter/free"
-]
+worker_threads = {}
+worker_threads_lock = threading.Lock()
 
 
 # ============================================================
@@ -212,7 +207,8 @@ button {
     font-size: 16px;
 }
 
-input, select {
+input,
+select {
     border: 1px solid #ccc;
     background: #fff;
 }
@@ -302,6 +298,16 @@ button.blue {
 .badge.router {
     background: #fff2d9;
     color: #875b00;
+}
+
+.badge.qwen {
+    background: #e8f7e9;
+    color: #24702c;
+}
+
+.badge.deepseek {
+    background: #eee8ff;
+    color: #5d3c9c;
 }
 
 .progress {
@@ -423,24 +429,40 @@ label {
         <strong>Translation System</strong>
 
         <p>
-            1. Choose your preferred translation model below.
+            🥇 Gemini 2.5 Flash
         </p>
 
         <p>
-            2. Translation progress is permanently saved to Supabase.
+            ↓ If unavailable or quota reached
         </p>
 
         <p>
-            3. If Gemini hits a limit, OpenRouter can take over.
+            🥈 Qwen FREE
+        </p>
+
+        <p>
+            ↓ If unavailable
+        </p>
+
+        <p>
+            🥉 DeepSeek FREE
+        </p>
+
+        <p>
+            ↓ If unavailable
+        </p>
+
+        <p>
+            🔄 Other OpenRouter $0 models
+        </p>
+
+        <p class="small">
+            Only free OpenRouter models are used.
         </p>
 
     </div>
 
-    <form
-        action="/upload"
-        method="POST"
-        enctype="multipart/form-data"
-    >
+    <form action="/upload" method="POST" enctype="multipart/form-data">
 
         <label for="file">
             Select File (.txt or .epub):
@@ -468,24 +490,17 @@ label {
                 (Recommended)
             </option>
 
-            <option value="deepseek/deepseek-r1:free">
-                🧠 DeepSeek R1
-                (Free OpenRouter)
+            <option value="qwen">
+                🧠 Qwen FREE
             </option>
 
-            <option value="meta-llama/llama-3.3-70b-instruct:free">
-                🦙 Meta Llama 3.3 70B
-                (Free OpenRouter)
+            <option value="deepseek">
+                🔬 DeepSeek FREE
             </option>
 
-            <option value="qwen/qwen-2.5-72b-instruct:free">
-                🌐 Qwen 2.5 72B
-                (Free OpenRouter)
-            </option>
-
-            <option value="openrouter/free">
-                🎲 OpenRouter
-                (Auto-select Free Model)
+            <option value="openrouter_free">
+                🎲 OpenRouter FREE
+                (Automatic)
             </option>
 
         </select>
@@ -499,10 +514,7 @@ label {
 
     </form>
 
-    <form
-        action="/lock"
-        method="POST"
-    >
+    <form action="/lock" method="POST">
 
         <button type="submit">
             🔒 Lock Website
@@ -528,16 +540,25 @@ label {
                         🤖 Gemini 2.5 Flash
                     </span>
 
+                {% elif job.provider_model and "qwen" in job.provider_model.lower() %}
+
+                    <span class="badge qwen">
+                        🧠 Qwen FREE
+                    </span>
+
+                {% elif job.provider_model and "deepseek" in job.provider_model.lower() %}
+
+                    <span class="badge deepseek">
+                        🔬 DeepSeek FREE
+                    </span>
+
                 {% else %}
 
                     <span class="badge router">
-
-                        🆓 OpenRouter
-
+                        🆓 OpenRouter FREE
                         {% if job.provider_model %}
                             ({{ job.provider_model }})
                         {% endif %}
-
                     </span>
 
                 {% endif %}
@@ -600,27 +621,24 @@ label {
 
                         <br><br>
 
-                        Progress is automatically saved to Supabase.
+                        Your progress is saved in Supabase.
 
                         <br><br>
 
-                        You can leave the page open or come back later.
+                        You can leave the page or redeploy the website.
+                        Saved chapters will remain available.
 
                     </div>
 
                     <script>
-                        setTimeout(
-                            function() {
-                                location.reload();
-                            },
-                            5000
-                        );
+                        setTimeout(function() {
+                            location.reload();
+                        }, 5000);
                     </script>
 
                 {% endif %}
 
-                {% if job.translated_chapters < job.total_chapters
-                      and not job.running %}
+                {% if job.translated_chapters < job.total_chapters and not job.running %}
 
                     <form
                         action="/translate/{{ job_id }}"
@@ -655,10 +673,7 @@ label {
                 {% else %}
 
                     <div class="small">
-
-                        🔒 Download unlocks once the first section
-                        translates.
-
+                        🔒 Download unlocks once the first section translates.
                     </div>
 
                 {% endif %}
@@ -666,7 +681,7 @@ label {
                 <form
                     action="/delete/{{ job_id }}"
                     method="POST"
-                    onsubmit="return confirm('Delete this novel permanently?');"
+                    onsubmit="return confirm('Delete this novel?');"
                 >
 
                     <button
@@ -733,45 +748,91 @@ def require_login():
     return None
 
 
+@app.route("/")
+def index():
+
+    load_jobs_from_supabase()
+
+    return render_template_string(
+        PAGE,
+        authenticated=is_authenticated(),
+        login_error=False,
+        jobs=jobs
+    )
+
+
+@app.route("/login", methods=["POST"])
+def login():
+
+    password = request.form.get(
+        "password",
+        ""
+    )
+
+    if (
+        SITE_PASSWORD
+        and secrets.compare_digest(
+            password,
+            SITE_PASSWORD
+        )
+    ):
+
+        session["authenticated"] = True
+
+        return redirect(
+            url_for("index")
+        )
+
+    return render_template_string(
+        PAGE,
+        authenticated=False,
+        login_error=True,
+        jobs={}
+    )
+
+
+@app.route("/lock", methods=["POST"])
+def lock():
+
+    session.clear()
+
+    return redirect(
+        url_for("index")
+    )
+
+
 # ============================================================
-# SUPABASE DATABASE
+# SUPABASE
 # ============================================================
 
-def supabase_configured():
+def supabase_enabled():
 
     return bool(
-        SUPABASE_URL and
-        SUPABASE_SERVICE_ROLE_KEY
+        SUPABASE_URL
+        and SUPABASE_SECRET_KEY
     )
 
 
 def supabase_headers():
 
     return {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation"
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        "Content-Type": "application/json"
     }
 
 
 def supabase_table_url():
 
     return (
-        f"{SUPABASE_URL}/rest/v1/translator_jobs"
+        SUPABASE_URL.rstrip("/")
+        + "/rest/v1/translator_jobs"
     )
 
 
-def save_job_to_supabase(job):
+def serialize_job(job):
 
-    if not supabase_configured():
-        raise RuntimeError(
-            "Supabase is not configured. "
-            "Make sure SUPABASE_URL and "
-            "SUPABASE_SERVICE_ROLE_KEY are set in Render."
-        )
-
-    payload = {
+    return {
         "id": job["id"],
         "filename": job["filename"],
         "chapters": job["chapters"],
@@ -785,75 +846,96 @@ def save_job_to_supabase(job):
         "error": job["error"],
         "running": job["running"],
         "provider": job["provider"],
-        "provider_model": job.get("provider_model")
+        "provider_model": job["provider_model"]
     }
+
+
+def save_new_job_to_supabase(job):
+
+    if not supabase_enabled():
+        raise RuntimeError(
+            "Supabase is not configured. "
+            "Set SUPABASE_URL and SUPABASE_SECRET_KEY."
+        )
+
+    payload = serialize_job(job)
 
     response = requests.post(
         supabase_table_url(),
-        headers=supabase_headers(),
-        params={
-            "on_conflict": "id"
+        headers={
+            **supabase_headers(),
+            "Prefer": "return=minimal"
         },
         json=payload,
-        timeout=30
+        timeout=SUPABASE_TIMEOUT
     )
 
     if response.status_code not in (200, 201):
+
         raise RuntimeError(
             "Supabase save failed: "
             f"{response.status_code} "
-            f"{response.text[:1000]}"
+            f"{response.text}"
         )
 
 
 def update_job_in_supabase(job):
 
-    if not supabase_configured():
+    if not supabase_enabled():
         return
 
-    payload = {
-        "filename": job["filename"],
-        "chapters": job["chapters"],
-        "original_words": job["original_words"],
-        "translations": job["translations"],
-        "translated_chapters": job["translated_chapters"],
-        "total_chapters": job["total_chapters"],
-        "words": job["words"],
-        "percent": job["percent"],
-        "status": job["status"],
-        "error": job["error"],
-        "running": job["running"],
-        "provider": job["provider"],
-        "provider_model": job.get("provider_model")
-    }
+    job_id = job["id"]
+
+    payload = serialize_job(job)
 
     response = requests.patch(
         supabase_table_url(),
-        headers=supabase_headers(),
+        headers={
+            **supabase_headers(),
+            "Prefer": "return=minimal"
+        },
         params={
-            "id": f"eq.{job['id']}"
+            "id": f"eq.{job_id}"
         },
         json=payload,
-        timeout=30
+        timeout=SUPABASE_TIMEOUT
     )
 
     if response.status_code not in (200, 204):
+
         raise RuntimeError(
             "Supabase update failed: "
             f"{response.status_code} "
-            f"{response.text[:1000]}"
+            f"{response.text}"
+        )
+
+
+def delete_job_from_supabase(job_id):
+
+    if not supabase_enabled():
+        return
+
+    response = requests.delete(
+        supabase_table_url(),
+        headers=supabase_headers(),
+        params={
+            "id": f"eq.{job_id}"
+        },
+        timeout=SUPABASE_TIMEOUT
+    )
+
+    if response.status_code not in (200, 204):
+
+        print(
+            "Supabase delete failed:",
+            response.status_code,
+            response.text
         )
 
 
 def load_jobs_from_supabase():
 
-    if not supabase_configured():
-
-        print(
-            "WARNING: Supabase is not configured. "
-            "Jobs will only exist in memory."
-        )
-
+    if not supabase_enabled():
         return
 
     try:
@@ -863,9 +945,9 @@ def load_jobs_from_supabase():
             headers=supabase_headers(),
             params={
                 "select": "*",
-                "order": "id.desc"
+                "order": "filename.asc"
             },
-            timeout=30
+            timeout=SUPABASE_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -873,7 +955,7 @@ def load_jobs_from_supabase():
             print(
                 "Supabase load failed:",
                 response.status_code,
-                response.text[:1000]
+                response.text
             )
 
             return
@@ -882,79 +964,20 @@ def load_jobs_from_supabase():
 
         with jobs_lock:
 
-            jobs.clear()
-
             for row in rows:
 
-                # A Render restart can happen while a translation
-                # thread was running. No thread survives the restart.
-                #
-                # Therefore any job that was marked running is reset
-                # to stopped so the user can safely press Continue.
-                if row.get("running"):
+                job_id = row.get("id")
 
-                    row["running"] = False
+                if not job_id:
+                    continue
 
-                    if (
-                        row.get("translated_chapters", 0)
-                        <
-                        row.get("total_chapters", 0)
-                    ):
-
-                        row["status"] = (
-                            "Translation paused because the server "
-                            "restarted. Press Continue Translation."
-                        )
-
-                jobs[row["id"]] = row
-
-        # Persist the reset running state.
-        for row in rows:
-
-            if row.get("running"):
-
-                try:
-                    update_job_in_supabase(row)
-
-                except Exception as e:
-
-                    print(
-                        "Could not reset running state:",
-                        repr(e)
-                    )
-
-        print(
-            f"Loaded {len(rows)} saved jobs from Supabase."
-        )
+                jobs[job_id] = row
 
     except Exception as e:
 
         print(
-            "Could not load jobs from Supabase:",
+            "Supabase load error:",
             repr(e)
-        )
-
-
-def delete_job_from_supabase(job_id):
-
-    if not supabase_configured():
-        return
-
-    response = requests.delete(
-        supabase_table_url(),
-        headers=supabase_headers(),
-        params={
-            "id": f"eq.{job_id}"
-        },
-        timeout=30
-    )
-
-    if response.status_code not in (200, 204):
-
-        raise RuntimeError(
-            "Supabase delete failed: "
-            f"{response.status_code} "
-            f"{response.text[:1000]}"
         )
 
 
@@ -967,10 +990,14 @@ def clean_text(text):
     text = text.replace(
         "\r\n",
         "\n"
-    ).replace(
+    )
+
+    text = text.replace(
         "\r",
         "\n"
-    ).replace(
+    )
+
+    text = text.replace(
         "\x00",
         ""
     )
@@ -994,18 +1021,23 @@ def count_words(text):
         )
     )
 
+    non_cjk = re.sub(
+        r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]',
+        '',
+        text
+    )
+
     space_word_count = len(
         re.findall(
             r"\b[\w'-]+\b",
-            re.sub(
-                r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]',
-                '',
-                text
-            )
+            non_cjk
         )
     )
 
-    return cjk_count + space_word_count
+    return (
+        cjk_count
+        + space_word_count
+    )
 
 
 def split_large_text(
@@ -1080,7 +1112,7 @@ def split_large_text(
 
 
 # ============================================================
-# PARSERS
+# FILE PARSERS
 # ============================================================
 
 def parse_txt(data):
@@ -1099,10 +1131,14 @@ def parse_txt(data):
 
         try:
 
-            text = data.decode(encoding)
+            text = data.decode(
+                encoding
+            )
+
             break
 
         except UnicodeDecodeError:
+
             continue
 
     if text is None:
@@ -1115,10 +1151,7 @@ def parse_txt(data):
     text = clean_text(text)
 
     pattern = re.compile(
-        r"(?im)^("
-        r"第\s*[0-9一二三四五六七八九十百千万两零]+\s*[章回节]"
-        r"|chapter\s+\d+.*"
-        r")$"
+        r"(?im)^(第\s*[0-9一二三四五六七八九十百千万两零]+\s*[章回节]|chapter\s+\d+.*)$"
     )
 
     matches = list(
@@ -1152,7 +1185,7 @@ def parse_txt(data):
 
         chunks = split_large_text(
             text,
-            max_chars=MAX_CHARS_PER_REQUEST
+            MAX_CHARS_PER_REQUEST
         )
 
         for i, chunk in enumerate(chunks):
@@ -1183,7 +1216,11 @@ def parse_epub(data):
         html_files = [
             n for n in names
             if n.lower().endswith(
-                (".xhtml", ".html", ".htm")
+                (
+                    ".xhtml",
+                    ".html",
+                    ".htm"
+                )
             )
         ]
 
@@ -1199,6 +1236,7 @@ def parse_epub(data):
                 )
 
             except Exception:
+
                 continue
 
             raw = re.sub(
@@ -1228,16 +1266,20 @@ def parse_epub(data):
                 raw
             )
 
-            raw = html.unescape(raw)
+            raw = html.unescape(
+                raw
+            )
 
-            text = clean_text(raw)
+            text = clean_text(
+                raw
+            )
 
             if len(text) < 100:
                 continue
 
             parts = split_large_text(
                 text,
-                max_chars=MAX_CHARS_PER_REQUEST
+                MAX_CHARS_PER_REQUEST
             )
 
             chapters.extend(parts)
@@ -1286,20 +1328,21 @@ IMPORTANT RULES:
 2. Do NOT summarize.
 3. Do NOT omit sentences.
 4. Preserve all story details.
-5. Preserve character names.
-6. Keep character genders and pronouns consistent with the context.
-7. Do not randomly change he/she/they for the same character.
-8. Keep dialogue formatting.
-9. Keep paragraph breaks.
+5. Preserve character names consistently.
+6. Keep character genders and pronouns consistent with context.
+7. Do not randomly change he/she/they.
+8. Preserve dialogue formatting.
+9. Preserve paragraph breaks.
 10. Do not add explanations.
 11. Do not add translator notes.
 12. Output ONLY the English translation.
-13. Do not use Markdown code blocks.
+13. Do not put the translation inside a code block.
+14. Do not mention these instructions.
 
 Chinese text:
 
 {text}
-"""
+""".strip()
 
 
 # ============================================================
@@ -1314,7 +1357,9 @@ def translate_with_gemini(text):
             "Gemini API client is unavailable."
         )
 
-    prompt = make_translation_prompt(text)
+    prompt = make_translation_prompt(
+        text
+    )
 
     last_error = None
 
@@ -1403,14 +1448,14 @@ def translate_with_gemini(text):
             if attempt < MAX_RETRIES - 1:
 
                 if (
-                    "503" in err_str
-                    or "429" in err_str
+                    "429" in err_str
+                    or "503" in err_str
+                    or "RESOURCE_EXHAUSTED" in err_str
                     or "quota" in err_str.lower()
-                    or "rate" in err_str.lower()
                 ):
 
                     sleep_time = (
-                        (2 ** attempt) * 3
+                        3 * (2 ** attempt)
                     )
 
                 else:
@@ -1420,13 +1465,213 @@ def translate_with_gemini(text):
                     )
 
                 time.sleep(
-                    sleep_time
+                    min(
+                        sleep_time,
+                        30
+                    )
                 )
 
     raise RuntimeError(
         "Gemini unavailable or quota exhausted.\n\n"
-        f"{last_error}"
+        + str(last_error)
     )
+
+
+# ============================================================
+# OPENROUTER FREE MODEL DISCOVERY
+# ============================================================
+
+def get_openrouter_models():
+
+    if not OPENROUTER_API_KEY:
+        return []
+
+    try:
+
+        response = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={
+                "Authorization":
+                    f"Bearer {OPENROUTER_API_KEY}"
+            },
+            timeout=30
+        )
+
+        if response.status_code != 200:
+
+            print(
+                "OpenRouter model list failed:",
+                response.status_code,
+                response.text
+            )
+
+            return []
+
+        data = response.json()
+
+        return data.get(
+            "data",
+            []
+        )
+
+    except Exception as e:
+
+        print(
+            "OpenRouter model discovery error:",
+            repr(e)
+        )
+
+        return []
+
+
+def is_free_openrouter_model(model):
+
+    model_id = str(
+        model.get("id", "")
+    )
+
+    pricing = model.get(
+        "pricing",
+        {}
+    )
+
+    prompt_price = str(
+        pricing.get(
+            "prompt",
+            ""
+        )
+    )
+
+    completion_price = str(
+        pricing.get(
+            "completion",
+            ""
+        )
+    )
+
+    # Explicit :free models are accepted.
+    if model_id.endswith(":free"):
+        return True
+
+    # Also accept models whose listed prompt and completion
+    # prices are exactly zero.
+    try:
+
+        return (
+            float(prompt_price) == 0
+            and float(completion_price) == 0
+        )
+
+    except Exception:
+
+        return False
+
+
+def model_is_translation_candidate(model):
+
+    model_id = str(
+        model.get("id", "")
+    ).lower()
+
+    name = str(
+        model.get("name", "")
+    ).lower()
+
+    combined = (
+        model_id
+        + " "
+        + name
+    )
+
+    bad_words = [
+        "embed",
+        "embedding",
+        "tts",
+        "whisper",
+        "audio",
+        "image",
+        "vision-only",
+        "moderation"
+    ]
+
+    for word in bad_words:
+
+        if word in combined:
+            return False
+
+    return True
+
+
+def free_model_candidates():
+
+    models = get_openrouter_models()
+
+    free_models = []
+
+    for model in models:
+
+        if not is_free_openrouter_model(
+            model
+        ):
+            continue
+
+        if not model_is_translation_candidate(
+            model
+        ):
+            continue
+
+        model_id = model.get(
+            "id",
+            ""
+        )
+
+        if model_id:
+            free_models.append(
+                model_id
+            )
+
+    # Remove duplicates.
+    free_models = list(
+        dict.fromkeys(
+            free_models
+        )
+    )
+
+    return free_models
+
+
+def categorize_model(model_id):
+
+    low = model_id.lower()
+
+    if "qwen" in low:
+        return 0
+
+    if "deepseek" in low:
+        return 1
+
+    if (
+        "llama" in low
+        or "gemma" in low
+        or "mistral" in low
+    ):
+        return 2
+
+    return 3
+
+
+def ordered_free_models():
+
+    models = free_model_candidates()
+
+    models.sort(
+        key=lambda x: (
+            categorize_model(x),
+            x
+        )
+    )
+
+    return models
 
 
 # ============================================================
@@ -1435,7 +1680,7 @@ def translate_with_gemini(text):
 
 def translate_with_openrouter(
     text,
-    preferred_model=None
+    preferred_category=None
 ):
 
     if not OPENROUTER_API_KEY:
@@ -1444,49 +1689,88 @@ def translate_with_openrouter(
             "OPENROUTER_API_KEY is missing."
         )
 
-    prompt = make_translation_prompt(text)
-
-    headers = {
-        "Authorization": (
-            f"Bearer {OPENROUTER_API_KEY}"
-        ),
-        "Content-Type": "application/json",
-        "HTTP-Referer": (
-            "https://novel-translator.onrender.com"
-        ),
-        "X-Title": "Free Novel Translator"
-    }
-
-    models_to_try = (
-        FREE_FALLBACK_MODELS.copy()
+    prompt = make_translation_prompt(
+        text
     )
 
-    if (
-        preferred_model
-        and preferred_model not in models_to_try
-    ):
+    headers = {
+        "Authorization":
+            f"Bearer {OPENROUTER_API_KEY}",
 
-        models_to_try.insert(
-            0,
-            preferred_model
+        "Content-Type":
+            "application/json",
+
+        "HTTP-Referer":
+            "https://novel-translator-i8wp.onrender.com",
+
+        "X-Title":
+            "Free Novel Translator"
+    }
+
+    current_models = ordered_free_models()
+
+    if not current_models:
+
+        raise RuntimeError(
+            "OpenRouter currently returned no suitable "
+            "$0/free models."
+        )
+
+    if preferred_category == "qwen":
+
+        current_models.sort(
+            key=lambda x: (
+                0 if "qwen" in x.lower()
+                else 1 if "deepseek" in x.lower()
+                else 2,
+                x
+            )
+        )
+
+    elif preferred_category == "deepseek":
+
+        current_models.sort(
+            key=lambda x: (
+                0 if "deepseek" in x.lower()
+                else 1 if "qwen" in x.lower()
+                else 2,
+                x
+            )
+        )
+
+    elif preferred_category == "openrouter_free":
+
+        # Keep Qwen first, then DeepSeek, then others.
+        current_models.sort(
+            key=lambda x: (
+                categorize_model(x),
+                x
+            )
         )
 
     last_error = None
 
-    for target_model in models_to_try:
+    for target_model in current_models:
 
         payload = {
             "model": target_model,
+
             "messages": [
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
+
             "temperature": 0.2
         }
 
         try:
+
+            print(
+                "Trying OpenRouter FREE model:",
+                target_model
+            )
 
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -1520,37 +1804,42 @@ def translate_with_openrouter(
                             target_model
                         )
 
+                        print(
+                            "OpenRouter FREE model succeeded:",
+                            actual_model
+                        )
+
                         return (
                             translated,
                             actual_model
                         )
 
-            else:
+            print(
+                "OpenRouter model failed:",
+                target_model,
+                response.status_code,
+                response.text[:500]
+            )
 
-                print(
-                    f"OpenRouter model "
-                    f"{target_model} returned "
-                    f"{response.status_code}: "
-                    f"{response.text[:500]}"
-                )
-
-                last_error = RuntimeError(
-                    f"HTTP {response.status_code}"
-                )
+            last_error = RuntimeError(
+                f"{target_model}: "
+                f"HTTP {response.status_code}"
+            )
 
         except Exception as e:
 
             print(
-                f"OpenRouter model "
-                f"{target_model} failed: {e}"
+                "OpenRouter model error:",
+                target_model,
+                repr(e)
             )
 
             last_error = e
 
     raise RuntimeError(
-        "All free OpenRouter fallback models "
-        "are currently unavailable.\n\n"
-        f"{last_error}"
+        "All currently available OpenRouter "
+        "$0/free models failed.\n\n"
+        + str(last_error)
     )
 
 
@@ -1569,15 +1858,18 @@ def send_telegram(message):
     try:
 
         response = requests.post(
-            (
-                "https://api.telegram.org/"
-                f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            ),
+            f"https://api.telegram.org/bot"
+            f"{TELEGRAM_BOT_TOKEN}/sendMessage",
+
             data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message
+                "chat_id":
+                    TELEGRAM_CHAT_ID,
+
+                "text":
+                    message
             },
-            timeout=15
+
+            timeout=TELEGRAM_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -1585,7 +1877,7 @@ def send_telegram(message):
             print(
                 "Telegram returned:",
                 response.status_code,
-                response.text[:500]
+                response.text
             )
 
     except Exception as e:
@@ -1603,7 +1895,10 @@ def send_telegram(message):
 def get_job(job_id):
 
     with jobs_lock:
-        return jobs.get(job_id)
+
+        return jobs.get(
+            job_id
+        )
 
 
 def calculate_job_words(job):
@@ -1620,23 +1915,114 @@ def calculate_job_words(job):
     )
 
 
+def set_job_value(
+    job,
+    key,
+    value
+):
+
+    with jobs_lock:
+
+        job[key] = value
+
+
+def persist_job(job):
+
+    try:
+
+        update_job_in_supabase(
+            job
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "Could not save job to Supabase:",
+            repr(e)
+        )
+
+        return False
+
+
+# ============================================================
+# WORKER MANAGEMENT
+# ============================================================
+
+def worker_is_running(job_id):
+
+    with worker_threads_lock:
+
+        thread = worker_threads.get(
+            job_id
+        )
+
+        return (
+            thread is not None
+            and thread.is_alive()
+        )
+
+
+def start_worker(job_id):
+
+    if worker_is_running(job_id):
+        return False
+
+    thread = threading.Thread(
+        target=translation_worker,
+        args=(job_id,),
+        daemon=True
+    )
+
+    with worker_threads_lock:
+
+        worker_threads[job_id] = thread
+
+    thread.start()
+
+    return True
+
+
 # ============================================================
 # TRANSLATION WORKER
 # ============================================================
 
 def translation_worker(job_id):
 
-    job = get_job(job_id)
+    job = get_job(
+        job_id
+    )
 
     if not job:
         return
 
     try:
 
-        job["running"] = True
-        job["error"] = None
+        set_job_value(
+            job,
+            "running",
+            True
+        )
 
-        update_job_in_supabase(job)
+        set_job_value(
+            job,
+            "error",
+            None
+        )
+
+        persist_job(
+            job
+        )
+
+        send_telegram(
+            "📚 Novel Translator\n\n"
+            f"{job['filename']}\n\n"
+            "🚀 Translation started.\n"
+            f"Progress: "
+            f"{job['translated_chapters']}/"
+            f"{job['total_chapters']} chapters."
+        )
 
         total = len(
             job["chapters"]
@@ -1644,17 +2030,16 @@ def translation_worker(job_id):
 
         while (
             job["translated_chapters"]
-            <
-            total
+            < total
         ):
 
-            index = (
-                job["translated_chapters"]
-            )
+            index = job[
+                "translated_chapters"
+            ]
 
-            original_chapter = (
-                job["chapters"][index]
-            )
+            original_chapter = job[
+                "chapters"
+            ][index]
 
             pieces = split_large_text(
                 original_chapter,
@@ -1667,24 +2052,21 @@ def translation_worker(job_id):
                 pieces
             ):
 
-                job["status"] = (
-                    f"Translating section "
-                    f"{index + 1}/{total} "
-                    f"(part "
-                    f"{piece_number + 1}/"
-                    f"{len(pieces)})..."
+                set_job_value(
+                    job,
+                    "status",
+                    (
+                        f"Translating chapter "
+                        f"{index + 1}/{total} "
+                        f"(part "
+                        f"{piece_number + 1}/"
+                        f"{len(pieces)})..."
+                    )
                 )
 
-                # Save current status.
-                try:
-                    update_job_in_supabase(
-                        job
-                    )
-                except Exception as e:
-                    print(
-                        "Status save warning:",
-                        repr(e)
-                    )
+                # ====================================================
+                # GEMINI PRIMARY
+                # ====================================================
 
                 if job["provider"] == "gemini":
 
@@ -1698,63 +2080,117 @@ def translation_worker(job_id):
 
                     except Exception as gemini_error:
 
-                        if OPENROUTER_API_KEY:
+                        print(
+                            "Gemini failed. "
+                            "Starting FREE OpenRouter fallback:",
+                            repr(gemini_error)
+                        )
 
-                            print(
-                                "Gemini limit/error hit. "
-                                "Falling back to OpenRouter."
-                            )
-
-                            job["provider"] = (
-                                "openrouter_free"
-                            )
-
-                            job["provider_model"] = (
-                                "openrouter/free"
-                            )
-
-                            try:
-
-                                update_job_in_supabase(
-                                    job
-                                )
-
-                            except Exception:
-                                pass
-
-                            (
-                                translated,
-                                actual_model
-                            ) = (
-                                translate_with_openrouter(
-                                    piece
-                                )
-                            )
-
-                            job["provider_model"] = (
-                                actual_model
-                            )
-
-                        else:
+                        if not OPENROUTER_API_KEY:
 
                             raise gemini_error
 
+                        set_job_value(
+                            job,
+                            "provider",
+                            "openrouter_free"
+                        )
+
+                        set_job_value(
+                            job,
+                            "provider_model",
+                            "qwen"
+                        )
+
+                        persist_job(
+                            job
+                        )
+
+                        send_telegram(
+                            "🔄 Novel Translator\n\n"
+                            f"{job['filename']}\n\n"
+                            "Gemini 2.5 Flash is unavailable "
+                            "or hit a limit.\n\n"
+                            "Switching to FREE OpenRouter models."
+                        )
+
+                        translated, actual_model = (
+                            translate_with_openrouter(
+                                piece,
+                                preferred_category="qwen"
+                            )
+                        )
+
+                        set_job_value(
+                            job,
+                            "provider_model",
+                            actual_model
+                        )
+
+                        persist_job(
+                            job
+                        )
+
+                # ====================================================
+                # OPENROUTER FREE
+                # ====================================================
+
                 else:
 
-                    (
-                        translated,
-                        actual_model
-                    ) = (
+                    preferred = job.get(
+                        "provider_model"
+                    )
+
+                    if preferred in (
+                        None,
+                        "",
+                        "qwen",
+                        "deepseek",
+                        "openrouter/free"
+                    ):
+
+                        preferred_category = preferred
+
+                    else:
+
+                        preferred_category = "openrouter_free"
+
+                    translated, actual_model = (
                         translate_with_openrouter(
                             piece,
-                            preferred_model=job.get(
-                                "provider_model"
-                            )
+                            preferred_category
                         )
                     )
 
-                    job["provider_model"] = (
+                    old_model = job.get(
+                        "provider_model"
+                    )
+
+                    set_job_value(
+                        job,
+                        "provider_model",
                         actual_model
+                    )
+
+                    if (
+                        old_model
+                        and old_model != actual_model
+                        and old_model not in (
+                            "qwen",
+                            "deepseek",
+                            "openrouter/free"
+                        )
+                    ):
+
+                        send_telegram(
+                            "🔄 Novel Translator\n\n"
+                            f"{job['filename']}\n\n"
+                            f"OpenRouter switched FREE model:\n"
+                            f"{old_model}\n→\n{actual_model}"
+                        )
+
+                    persist_job(
+                        job
                     )
 
                 translated_pieces.append(
@@ -1765,18 +2201,15 @@ def translation_worker(job_id):
                     REQUEST_DELAY
                 )
 
+            # ========================================================
+            # COMPLETED CHAPTER
+            # ========================================================
+
             final_translation = (
                 "\n\n".join(
                     translated_pieces
                 ).strip()
             )
-
-            # ------------------------------------------------
-            # IMPORTANT:
-            # Only after the entire chapter/section has
-            # translated successfully do we permanently
-            # advance translated_chapters.
-            # ------------------------------------------------
 
             job["translations"].append(
                 final_translation
@@ -1793,13 +2226,13 @@ def translation_worker(job_id):
             job["percent"] = int(
                 (
                     job["translated_chapters"]
-                    /
-                    total
-                ) * 100
+                    / total
+                )
+                * 100
             )
 
-            model_display = (
-                job.get("provider_model")
+            model_display = job.get(
+                "provider_model"
             )
 
             if job["provider"] == "gemini":
@@ -1812,39 +2245,45 @@ def translation_worker(job_id):
 
                 provider_text = (
                     "OpenRouter FREE"
+                    f" ({model_display})"
                 )
 
-                if model_display:
-
-                    provider_text += (
-                        f" ({model_display})"
-                    )
-
             job["status"] = (
-                f"Completed section "
+                f"Completed chapter "
                 f"{job['translated_chapters']}/"
                 f"{total}. "
                 f"{job['words']:,} words. "
                 f"Active: {provider_text}."
             )
 
-            # ------------------------------------------------
-            # THIS IS THE IMPORTANT SAVE.
-            #
-            # Every completed chapter is written to Supabase.
-            # Therefore a Render restart after this point
-            # does not lose that completed chapter.
-            # ------------------------------------------------
-
-            update_job_in_supabase(
+            # IMPORTANT:
+            # Save after every completed chapter.
+            persist_job(
                 job
             )
 
-            print(
-                f"Saved progress for "
-                f"{job['filename']}: "
-                f"{job['translated_chapters']}/{total}"
-            )
+            # Telegram progress every 10 chapters,
+            # plus chapter 1.
+            if (
+                job["translated_chapters"] == 1
+                or job["translated_chapters"] % 10 == 0
+            ):
+
+                send_telegram(
+                    "📖 Novel Translator\n\n"
+                    f"{job['filename']}\n\n"
+                    f"Progress: "
+                    f"{job['translated_chapters']}/"
+                    f"{total} chapters "
+                    f"({job['percent']}%).\n\n"
+                    f"English words: "
+                    f"{job['words']:,}\n\n"
+                    f"Model: {provider_text}"
+                )
+
+        # ============================================================
+        # COMPLETE
+        # ============================================================
 
         job["status"] = (
             "Translation complete!"
@@ -1852,15 +2291,20 @@ def translation_worker(job_id):
 
         job["running"] = False
 
-        update_job_in_supabase(
+        job["percent"] = 100
+
+        persist_job(
             job
         )
 
         send_telegram(
-            "Novel Translator:\n\n"
+            "🎉 Novel Translator\n\n"
             f"{job['filename']}\n\n"
-            "Translation complete.\n"
-            f"{job['words']:,} English words."
+            "✅ Translation complete!\n\n"
+            f"English words: "
+            f"{job['words']:,}\n\n"
+            "Your translated EPUB is ready "
+            "to download from the website."
         )
 
     except Exception as e:
@@ -1878,93 +2322,117 @@ def translation_worker(job_id):
 
         job["running"] = False
 
-        try:
-
-            update_job_in_supabase(
-                job
-            )
-
-        except Exception as save_error:
-
-            print(
-                "Could not save error state:",
-                repr(save_error)
-            )
-
-        send_telegram(
-            "Novel Translator ERROR:\n\n"
-            f"{job['filename']}\n\n"
-            f"{e}"
+        persist_job(
+            job
         )
 
+        send_telegram(
+            "❌ Novel Translator ERROR\n\n"
+            f"{job['filename']}\n\n"
+            f"{str(e)}\n\n"
+            "Your saved chapters remain in Supabase."
+        )
+
+    finally:
+
+        with worker_threads_lock:
+
+            worker_threads.pop(
+                job_id,
+                None
+            )
+
 
 # ============================================================
-# LOAD SAVED JOBS
+# AUTOMATIC RESUME
 # ============================================================
 
-load_jobs_from_supabase()
+def resume_saved_jobs():
+
+    time.sleep(5)
+
+    print(
+        "Checking Supabase for jobs "
+        "that need to resume..."
+    )
+
+    load_jobs_from_supabase()
+
+    for job_id, job in list(
+        jobs.items()
+    ):
+
+        try:
+
+            translated = int(
+                job.get(
+                    "translated_chapters",
+                    0
+                )
+            )
+
+            total = int(
+                job.get(
+                    "total_chapters",
+                    0
+                )
+            )
+
+            was_running = bool(
+                job.get(
+                    "running",
+                    False
+                )
+            )
+
+            if (
+                was_running
+                and translated < total
+            ):
+
+                print(
+                    "Resuming job after restart:",
+                    job.get("filename"),
+                    translated,
+                    "/",
+                    total
+                )
+
+                job["running"] = False
+
+                job["status"] = (
+                    "Resuming saved translation..."
+                )
+
+                persist_job(
+                    job
+                )
+
+                start_worker(
+                    job_id
+                )
+
+        except Exception as e:
+
+            print(
+                "Resume check error:",
+                repr(e)
+            )
+
+
+# Start automatic resume check when
+# the application process starts.
+resume_thread = threading.Thread(
+    target=resume_saved_jobs,
+    daemon=True
+)
+
+resume_thread.start()
 
 
 # ============================================================
 # ROUTES
 # ============================================================
-
-@app.route("/")
-def index():
-
-    return render_template_string(
-        PAGE,
-        authenticated=is_authenticated(),
-        login_error=False,
-        jobs=jobs
-    )
-
-
-@app.route(
-    "/login",
-    methods=["POST"]
-)
-def login():
-
-    password = request.form.get(
-        "password",
-        ""
-    )
-
-    if (
-        SITE_PASSWORD
-        and secrets.compare_digest(
-            password,
-            SITE_PASSWORD
-        )
-    ):
-
-        session["authenticated"] = True
-
-        return redirect(
-            url_for("index")
-        )
-
-    return render_template_string(
-        PAGE,
-        authenticated=False,
-        login_error=True,
-        jobs={}
-    )
-
-
-@app.route(
-    "/lock",
-    methods=["POST"]
-)
-def lock():
-
-    session.clear()
-
-    return redirect(
-        url_for("index")
-    )
-
 
 @app.route(
     "/upload",
@@ -2008,45 +2476,76 @@ def upload():
             uuid.uuid4()
         )
 
-        provider = (
-            "gemini"
-            if chosen_model == "gemini"
-            else "openrouter_free"
-        )
+        if chosen_model == "gemini":
 
-        provider_model = (
-            None
-            if chosen_model == "gemini"
-            else chosen_model
-        )
+            provider = "gemini"
+            provider_model = None
+
+        elif chosen_model == "qwen":
+
+            provider = "openrouter_free"
+            provider_model = "qwen"
+
+        elif chosen_model == "deepseek":
+
+            provider = "openrouter_free"
+            provider_model = "deepseek"
+
+        else:
+
+            provider = "openrouter_free"
+            provider_model = "openrouter_free"
 
         job = {
-            "id": job_id,
-            "filename": uploaded.filename,
-            "chapters": chapters,
-            "original_words": original_words,
-            "translations": [],
-            "translated_chapters": 0,
-            "total_chapters": len(chapters),
-            "words": 0,
-            "percent": 0,
-            "status": (
-                "Uploaded. Ready to translate."
-            ),
-            "error": None,
-            "running": False,
-            "provider": provider,
-            "provider_model": provider_model
+
+            "id":
+                job_id,
+
+            "filename":
+                uploaded.filename,
+
+            "chapters":
+                chapters,
+
+            "original_words":
+                original_words,
+
+            "translations":
+                [],
+
+            "translated_chapters":
+                0,
+
+            "total_chapters":
+                len(chapters),
+
+            "words":
+                0,
+
+            "percent":
+                0,
+
+            "status":
+                "Uploaded. Ready to translate.",
+
+            "error":
+                None,
+
+            "running":
+                False,
+
+            "provider":
+                provider,
+
+            "provider_model":
+                provider_model
         }
 
-        # Save permanently FIRST.
-        save_job_to_supabase(
+        jobs[job_id] = job
+
+        save_new_job_to_supabase(
             job
         )
-
-        # Then put it into memory.
-        with jobs_lock:
-            jobs[job_id] = job
 
         return redirect(
             url_for("index")
@@ -2061,7 +2560,9 @@ def upload():
 
         return (
             "<h2>Upload Error</h2>"
-            f"<p>{html.escape(str(e))}</p>"
+            "<p>"
+            + html.escape(str(e))
+            + "</p>"
             "<p><a href='/'>Go back</a></p>"
         )
 
@@ -2077,8 +2578,6 @@ def translate(job_id):
 
     if not job:
 
-        # Try reloading from Supabase in case
-        # the in-memory cache does not have it.
         load_jobs_from_supabase()
 
         job = get_job(
@@ -2087,21 +2586,28 @@ def translate(job_id):
 
     if not job:
 
-        return (
-            "<h2>Job not found</h2>"
-            "<p><a href='/'>Go back</a></p>"
+        return redirect(
+            url_for("index")
         )
 
-    if job["running"]:
+    if job.get(
+        "running",
+        False
+    ):
 
         return redirect(
             url_for("index")
         )
 
     if (
-        job["translated_chapters"]
-        >=
-        job["total_chapters"]
+        job.get(
+            "translated_chapters",
+            0
+        )
+        >= job.get(
+            "total_chapters",
+            0
+        )
     ):
 
         return redirect(
@@ -2109,45 +2615,20 @@ def translate(job_id):
         )
 
     job["error"] = None
+
     job["running"] = True
+
     job["status"] = (
-        "Translation starting..."
+        "Starting translation..."
     )
 
-    try:
-
-        update_job_in_supabase(
-            job
-        )
-
-    except Exception as e:
-
-        job["running"] = False
-
-        job["error"] = str(e)
-
-        job["status"] = (
-            "Could not start translation."
-        )
-
-        try:
-            update_job_in_supabase(
-                job
-            )
-        except Exception:
-            pass
-
-        return redirect(
-            url_for("index")
-        )
-
-    thread = threading.Thread(
-        target=translation_worker,
-        args=(job_id,),
-        daemon=True
+    persist_job(
+        job
     )
 
-    thread.start()
+    start_worker(
+        job_id
+    )
 
     return redirect(
         url_for("index")
@@ -2173,7 +2654,9 @@ def download(job_id):
 
     if (
         not job
-        or not job.get("translations")
+        or not job.get(
+            "translations"
+        )
     ):
 
         return (
@@ -2195,18 +2678,24 @@ def download(job_id):
             io.BytesIO(
                 epub_bytes
             ),
-            mimetype="application/epub+zip",
-            as_attachment=True,
-            download_name=(
+
+            mimetype:
+                "application/epub+zip",
+
+            as_attachment:
+                True,
+
+            download_name:
                 f"{base_name}_translated.epub"
-            )
         )
 
     except Exception as e:
 
         return (
             "<h2>EPUB creation error</h2>"
-            f"<p>{html.escape(str(e))}</p>"
+            "<p>"
+            + html.escape(str(e))
+            + "</p>"
             "<p><a href='/'>Go back</a></p>"
         )
 
@@ -2244,17 +2733,20 @@ def create_epub(
 
         epub.writestr(
             "META-INF/container.xml",
+
             """<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0"
 xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
 <rootfiles>
-<rootfile full-path="OEBPS/content.opf"
+<rootfile
+full-path="OEBPS/content.opf"
 media-type="application/oebps-package+xml"/>
 </rootfiles>
 </container>"""
         )
 
         manifest_items = []
+
         spine_items = []
 
         for i, translation in enumerate(
@@ -2277,18 +2769,22 @@ media-type="application/oebps-package+xml"/>
                 safe_translation.split("\n")
             )
 
-            body = "".join(
-                f"<p>{p.strip()}</p>\n"
-                for p in paragraphs
-                if p.strip()
-            )
+            body = ""
+
+            for p in paragraphs:
+
+                if p.strip():
+
+                    body += (
+                        f"<p>{p.strip()}</p>\n"
+                    )
 
             chapter_html = (
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
                 '<!DOCTYPE html>\n'
                 '<html xmlns="http://www.w3.org/1999/xhtml">\n'
                 '<head>\n'
-                f'<meta charset="UTF-8"/>'
+                '<meta charset="UTF-8"/>\n'
                 f'<title>{html.escape(title)}</title>\n'
                 '</head>\n'
                 '<body>\n'
@@ -2304,13 +2800,15 @@ media-type="application/oebps-package+xml"/>
             )
 
             manifest_items.append(
-                f'<item id="chapter{i + 1}" '
+                f'<item '
+                f'id="chapter{i + 1}" '
                 f'href="{chapter_filename}" '
                 f'media-type="application/xhtml+xml"/>'
             )
 
             spine_items.append(
-                f'<itemref idref="chapter{i + 1}"/>'
+                f'<itemref '
+                f'idref="chapter{i + 1}"/>'
             )
 
         css = (
@@ -2343,6 +2841,7 @@ media-type="application/oebps-package+xml"/>
 
         opf = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
+
             '<package version="3.0" '
             'xmlns="http://www.idpf.org/2007/opf" '
             'unique-identifier="BookID">\n'
@@ -2368,16 +2867,19 @@ media-type="application/oebps-package+xml"/>
 
             '<manifest>\n'
 
-            '<item id="style" '
+            '<item '
+            'id="style" '
             'href="style.css" '
-            'media-type="text/css"/>\n'
+            'media-type="text/css"/>'
 
-            f'{manifest}\n'
+            f'\n{manifest}\n'
 
             '</manifest>\n'
 
             '<spine>\n'
+
             f'{spine}\n'
+
             '</spine>\n'
 
             '</package>'
@@ -2401,88 +2903,86 @@ media-type="application/oebps-package+xml"/>
 )
 def delete(job_id):
 
-    try:
+    job = get_job(
+        job_id
+    )
 
-        delete_job_from_supabase(
-            job_id
-        )
-
-        with jobs_lock:
-
-            jobs.pop(
-                job_id,
-                None
-            )
-
-        return redirect(
-            url_for("index")
-        )
-
-    except Exception as e:
+    if job and job.get(
+        "running",
+        False
+    ):
 
         return (
-            "<h2>Delete Error</h2>"
-            f"<p>{html.escape(str(e))}</p>"
-            "<p><a href='/'>Go back</a></p>"
+            "Cannot delete a novel "
+            "while it is translating. "
+            "Wait until it stops first."
         )
 
+    jobs.pop(
+        job_id,
+        None
+    )
+
+    delete_job_from_supabase(
+        job_id
+    )
+
+    return redirect(
+        url_for("index")
+    )
+
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
-@app.route(
-    "/health"
-)
+@app.route("/health")
 def health():
 
     return {
-        "status": "ok",
 
-        "gemini_configured": bool(
-            GEMINI_API_KEY
-        ),
+        "status":
+            "ok",
 
-        "openrouter_configured": bool(
-            OPENROUTER_API_KEY
-        ),
+        "gemini_configured":
+            bool(GEMINI_API_KEY),
 
-        "supabase_configured": bool(
-            SUPABASE_URL
-            and SUPABASE_SERVICE_ROLE_KEY
-        ),
+        "gemini_model":
+            GEMINI_MODEL,
 
-        "supabase_url_configured": bool(
-            SUPABASE_URL
-        ),
+        "openrouter_configured":
+            bool(OPENROUTER_API_KEY),
 
-        "supabase_service_key_configured": bool(
-            SUPABASE_SERVICE_ROLE_KEY
-        ),
+        "supabase_configured":
+            bool(
+                SUPABASE_URL
+                and SUPABASE_SECRET_KEY
+            ),
 
-        "password_enabled": bool(
-            SITE_PASSWORD
-        ),
+        "telegram_configured":
+            bool(
+                TELEGRAM_BOT_TOKEN
+                and TELEGRAM_CHAT_ID
+            ),
 
-        "telegram_configured": bool(
-            TELEGRAM_BOT_TOKEN
-            and TELEGRAM_CHAT_ID
-        ),
+        "automatic_resume":
+            True,
 
-        "gemini_model": GEMINI_MODEL,
+        "free_openrouter_only":
+            True,
 
-        "saved_jobs_in_memory": len(
-            jobs
-        ),
-
-        "openrouter_mode": (
-            "Multi-model selection enabled"
-        )
+        "translation_priority":
+            [
+                "Gemini 2.5 Flash",
+                "Qwen FREE",
+                "DeepSeek FREE",
+                "Other OpenRouter $0 models"
+            ]
     }
 
 
 # ============================================================
-# START SERVER
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
