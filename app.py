@@ -48,8 +48,8 @@ SITE_PASSWORD = os.environ.get("SITE_PASSWORD", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Updated default model to gemini-3.6-flash to fix 404 API error
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip()
+# Hardcoded gemini-3.6-flash so Render environment settings cannot break it
+GEMINI_MODEL = "gemini-3.6-flash"
 OPENROUTER_PREFERRED_FREE = "qwen/qwen3.6-plus:free"
 OPENROUTER_FREE_ROUTER = "openrouter/free"
 
