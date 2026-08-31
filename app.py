@@ -358,6 +358,10 @@ button.blue {
     padding: 13px;
     border-radius: 9px;
     background: #f7f7f7;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
 }
 
 .download-box {
@@ -542,11 +546,19 @@ hr {
 
                 <div class="word-box">
 
-                    📝 English words:
+                    <div>
+                        📄 Original Words/Chars:
+                        <strong>
+                            {{ "{:,}".format(job.original_words) }}
+                        </strong>
+                    </div>
 
-                    <strong>
-                        {{ "{:,}".format(job.words) }}
-                    </strong>
+                    <div>
+                        📝 English words:
+                        <strong>
+                            {{ "{:,}".format(job.words) }}
+                        </strong>
+                    </div>
 
                 </div>
 
@@ -809,13 +821,14 @@ def clean_text(text):
 
 def count_words(text):
 
-    return len(
-        re.findall(
-            r"\b[\w'-]+\b",
-            text,
-            flags=re.UNICODE
-        )
-    )
+    if not text:
+        return 0
+
+    # Counts both space-separated words (English) and CJK characters (Chinese/Japanese/Korean)
+    cjk_count = len(re.findall(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', text))
+    space_word_count = len(re.findall(r"\b[\w'-]+\b", re.sub(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', '', text)))
+
+    return cjk_count + space_word_count
 
 
 def split_large_text(
@@ -1743,6 +1756,9 @@ def upload():
             data
         )
 
+        # Calculate original word/character count across all chapters
+        original_words = sum(count_words(ch) for ch in chapters)
+
         job_id = str(
             uuid.uuid4()
         )
@@ -1757,6 +1773,9 @@ def upload():
 
             "chapters":
                 chapters,
+
+            "original_words":
+                original_words,
 
             "translations":
                 [],
@@ -1794,7 +1813,9 @@ def upload():
             + uploaded.filename
             + ": "
             + str(len(chapters))
-            + " chapters"
+            + " chapters, "
+            + str(original_words)
+            + " original words"
         )
 
         return redirect(
