@@ -33,8 +33,13 @@ app = Flask(__name__)
 
 app.secret_key = os.environ.get(
     "FLASK_SECRET_KEY",
-    secrets.token_hex(32)
+    "super-secret-key-change-this-in-render"
 )
+
+# Render / Reverse Proxy Session Fixes
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -742,13 +747,32 @@ def require_login():
         return None
 
     if not is_authenticated():
+        # Prevent redirect loops if already on index with login screen
+        if request.endpoint == "index":
+            return None
         return redirect(
-            url_for(
-                "index"
-            )
+            url_for("index")
         )
 
     return None
+
+
+@app.route("/")
+def index():
+
+    authenticated = is_authenticated()
+
+    return render_template_string(
+        PAGE,
+
+        authenticated=authenticated,
+
+        login_error=False,
+
+        jobs=jobs,
+
+        min_words=DOWNLOAD_MIN_WORDS
+    )
 
 
 @app.route("/login", methods=["POST"])
@@ -1292,10 +1316,9 @@ def translate_with_gemini(text):
                 repr(e)
             )
 
-            # Retry on 503 UNAVAILABLE or 429 RATE LIMIT spikes with exponential backoff
             if attempt < MAX_RETRIES - 1:
                 if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    sleep_time = (2 ** attempt) * 5  # Waits 5s, 10s, 20s, 40s...
+                    sleep_time = (2 ** attempt) * 5
                     print(f"Gemini server load spike (503/429). Retrying in {sleep_time} seconds...")
                     time.sleep(sleep_time)
                 else:
@@ -1813,10 +1836,6 @@ def translation_worker(job_id):
                     + "..."
                 )
 
-                # ====================================================
-                # GEMINI FIRST
-                # ====================================================
-
                 if job["provider"] == "gemini":
 
                     try:
@@ -1863,10 +1882,6 @@ def translation_worker(job_id):
                             raise gemini_error
 
                 else:
-
-                    # =================================================
-                    # OPENROUTER STAYS OPENROUTER
-                    # =================================================
 
                     translated, actual_model = (
                         translate_with_openrouter(
@@ -2006,28 +2021,6 @@ def translation_worker(job_id):
             + "\n\n"
             + str(e)
         )
-
-
-# ============================================================
-# HOME
-# ============================================================
-
-@app.route("/")
-def index():
-
-    authenticated = is_authenticated()
-
-    return render_template_string(
-        PAGE,
-
-        authenticated=authenticated,
-
-        login_error=False,
-
-        jobs=jobs,
-
-        min_words=DOWNLOAD_MIN_WORDS
-    )
 
 
 # ============================================================
@@ -2376,7 +2369,7 @@ media-type="application/oebps-package+xml"/>
                 "\n"
                 "<body>"
                 "\n"
-                "2"
+                "<h2>"
                 + html.escape(title)
                 + "</h2>"
                 "\n"
