@@ -89,30 +89,20 @@ TELEGRAM_CHAT_ID = os.environ.get(
 # MODEL CONFIGURATION
 # ============================================================
 
-# Standard production model to avoid 404 errors completely
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
     "gemini-2.5-flash"
 ).strip()
 
-OPENROUTER_FREE_ROUTER = "openrouter/free"
-
 
 # ============================================================
-# TRANSLATION SETTINGS (OPTIMIZED FOR STABILITY & ZERO HANGS)
+# TRANSLATION SETTINGS
 # ============================================================
 
-# 10,000 characters prevents openrouter payload timeouts while remaining fast
 MAX_CHARS_PER_REQUEST = 10000
-
-# 3.0-second delay keeps Gemini safely under the 10 RPM rate limit
 REQUEST_DELAY = 3.0
-
 MAX_RETRIES = 5
-
-# Short timeout so stuck free OpenRouter models skip quickly
 OPENROUTER_TIMEOUT = 20
-
 GEMINI_TIMEOUT = 120
 
 
@@ -142,7 +132,6 @@ if GEMINI_API_KEY:
 # ============================================================
 
 jobs = {}
-
 jobs_lock = threading.Lock()
 
 
@@ -150,18 +139,12 @@ jobs_lock = threading.Lock()
 # OPENROUTER STATE & ROTATION
 # ============================================================
 
-openrouter_model_cache = {
-    "model": None,
-    "time": 0
-}
-
-OPENROUTER_MODEL_CACHE_SECONDS = 300
-
-# Fast free fallback models on OpenRouter
 FREE_FALLBACK_MODELS = [
+    "deepseek/deepseek-r1:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free",
     "nvidia/nemotron-3-nano-30b-a3b:free",
     "google/gemma-4-31b:free",
-    "qwen/qwen-2.5-7b-instruct:free",
     "openrouter/free"
 ]
 
@@ -175,9 +158,7 @@ PAGE = r"""
 <html>
 <head>
 
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta charset="UTF-8">
 
 <title>Novel Translator</title>
@@ -216,6 +197,7 @@ h2 {
 
 input[type=file],
 input[type=password],
+select,
 button {
     width: 100%;
     padding: 14px;
@@ -224,8 +206,9 @@ button {
     font-size: 16px;
 }
 
-input {
+input, select {
     border: 1px solid #ccc;
+    background: #fff;
 }
 
 button {
@@ -282,14 +265,6 @@ button.blue {
     white-space: pre-wrap;
 }
 
-.success {
-    background: #e5f8e8;
-    border-left: 5px solid #1d8a37;
-    padding: 13px;
-    border-radius: 8px;
-    margin-top: 15px;
-}
-
 .job {
     border: 1px solid #ddd;
     padding: 16px;
@@ -316,11 +291,6 @@ button.blue {
 .badge.gemini {
     background: #e7f0ff;
     color: #1659a6;
-}
-
-.badge.qwen {
-    background: #e9f8e9;
-    color: #176b2c;
 }
 
 .badge.router {
@@ -383,18 +353,15 @@ a.button.green {
     background: #177a32;
 }
 
-.lock-box {
-    margin-bottom: 20px;
-}
-
 .center {
     text-align: center;
 }
 
-hr {
-    border: none;
-    border-top: 1px solid #ddd;
-    margin: 25px 0;
+label {
+    display: block;
+    margin-top: 12px;
+    font-weight: bold;
+    font-size: 14px;
 }
 
 </style>
@@ -408,102 +375,52 @@ hr {
 {% if not authenticated %}
 
     <div class="center">
-
         <h1>🔒 Novel Translator</h1>
-
-        <p>
-            This website is password protected.
-        </p>
+        <p>This website is password protected.</p>
 
         {% if login_error %}
-            <div class="error">
-                Incorrect password.
-            </div>
+            <div class="error">Incorrect password.</div>
         {% endif %}
 
         <form action="/login" method="POST">
-
-            <input
-                type="password"
-                name="password"
-                placeholder="Enter website password"
-                required
-                autofocus
-            >
-
-            <button type="submit">
-                🔓 Enter Website
-            </button>
-
+            <input type="password" name="password" placeholder="Enter website password" required autofocus>
+            <button type="submit">🔓 Enter Website</button>
         </form>
-
     </div>
 
 {% else %}
 
     <h1>📚 Novel Translator</h1>
 
-    <p>
-        Upload a TXT or EPUB novel and translate it to English.
-    </p>
+    <p>Upload a TXT or EPUB novel and translate it to English.</p>
 
     <div class="notice">
-
-        <strong>Translation System (Speed Optimized & 100% Free)</strong>
-
-        <p>
-            1. Gemini 2.5 Flash runs first for high speed and stability.
-        </p>
-
-        <p>
-            2. 10k character chunks prevent payload timeouts.
-        </p>
-
-        <p>
-            3. EPUB download unlocks as soon as the first English text translates.
-        </p>
-
-        <p>
-            4. If Gemini spikes, OpenRouter multi-model free rotation takes over seamlessly.
-        </p>
-
+        <strong>Translation System</strong>
+        <p>1. Choose your preferred translation model below.</p>
+        <p>2. If Gemini or your selected model hits limits, OpenRouter rotation keeps translating smoothly.</p>
     </div>
 
+    <form action="/upload" method="POST" enctype="multipart/form-data">
 
-    <form
-        action="/upload"
-        method="POST"
-        enctype="multipart/form-data"
-    >
+        <label for="file">Select File (.txt or .epub):</label>
+        <input type="file" id="file" name="file" accept=".txt,.epub" required>
 
-        <input
-            type="file"
-            name="file"
-            accept=".txt,.epub"
-            required
-        >
+        <label for="model_choice">Choose Preferred Translation Model:</label>
+        <select name="model_choice" id="model_choice">
+            <option value="gemini">🤖 Gemini 2.5 Flash (Recommended - Fastest & High Quality)</option>
+            <option value="deepseek/deepseek-r1:free">🧠 DeepSeek R1 (Free OpenRouter)</option>
+            <option value="meta-llama/llama-3.3-70b-instruct:free">🦙 Meta Llama 3.3 70B (Free OpenRouter)</option>
+            <option value="qwen/qwen-2.5-72b-instruct:free">🌐 Qwen 2.5 72B (Free OpenRouter)</option>
+            <option value="openrouter/free">🎲 OpenRouter (Auto-select Best Available Free Model)</option>
+        </select>
 
-        <button
-            type="submit"
-            class="blue"
-        >
-            📤 Upload Novel
-        </button>
+        <button type="submit" class="blue">📤 Upload Novel</button>
 
     </form>
 
-
-    <form
-        action="/lock"
-        method="POST"
-    >
-
-        <button type="submit">
-            🔒 Lock Website
-        </button>
-
+    <form action="/lock" method="POST">
+        <button type="submit">🔒 Lock Website</button>
     </form>
-
 
     {% if jobs %}
 
@@ -513,173 +430,69 @@ hr {
 
             <div class="job">
 
-                <div class="job-title">
-                    {{ job.filename }}
-                </div>
-
+                <div class="job-title">{{ job.filename }}</div>
 
                 {% if job.provider == "gemini" %}
-
-                    <span class="badge gemini">
-                        🤖 Gemini 2.5 Flash
-                    </span>
-
-                {% elif job.provider == "openrouter_qwen" %}
-
-                    <span class="badge qwen">
-                        🤖 OpenRouter Free Fallback
-                    </span>
-
-                {% elif job.provider == "openrouter_free" %}
-
+                    <span class="badge gemini">🤖 Gemini 2.5 Flash</span>
+                {% else %}
                     <span class="badge router">
-                        🆓 OpenRouter FREE
+                        🆓 OpenRouter {% if job.provider_model %}({{ job.provider_model }}){% endif %}
                     </span>
-
                 {% endif %}
 
-
-                <p>
-                    📖 Chapters:
-                    {{ job.translated_chapters }}/{{ job.total_chapters }}
-                </p>
+                <p>📖 Chapters: {{ job.translated_chapters }}/{{ job.total_chapters }}</p>
 
                 <div class="word-box">
-
                     <div>
-                        📄 Original Words/Chars:
-                        <strong>
-                            {{ "{:,}".format(job.original_words) }}
-                        </strong>
+                        📄 Original Words/Chars: <strong>{{ "{:,}".format(job.original_words) }}</strong>
                     </div>
-
                     <div>
-                        📝 English words:
-                        <strong>
-                            {{ "{:,}".format(job.words) }}
-                        </strong>
+                        📝 English words: <strong>{{ "{:,}".format(job.words) }}</strong>
                     </div>
-
                 </div>
-
 
                 {% if job.percent > 0 %}
-
                     <div class="progress">
-
-                        <div
-                            class="bar"
-                            style="width: {{ job.percent }}%;"
-                        >
-                            {{ job.percent }}%
-                        </div>
-
+                        <div class="bar" style="width: {{ job.percent }}%;">{{ job.percent }}%</div>
                     </div>
-
                 {% endif %}
 
-
-                <div class="status">
-
-                    Status:
-                    {{ job.status }}
-
-                </div>
-
+                <div class="status">Status: {{ job.status }}</div>
 
                 {% if job.error %}
-
-                    <div class="error">
-
-                        {{ job.error }}
-
-                    </div>
-
+                    <div class="error">{{ job.error }}</div>
                 {% endif %}
 
-
                 {% if job.running %}
-
                     <div class="warning">
-
                         ⏳ Translation is currently running.
-
                         <br><br>
-
-                        You can leave this page open.
-                        The translation continues in the background.
-
+                        You can leave this page open; it updates automatically in the background.
                     </div>
 
                     <script>
-
-                    setTimeout(
-                        function() {
-                            location.reload();
-                        },
-                        5000
-                    );
-
+                    setTimeout(function() { location.reload(); }, 5000);
                     </script>
-
                 {% endif %}
 
-
-                {% if job.translated_chapters < job.total_chapters
-                      and not job.running %}
-
-                    <form
-                        action="/translate/{{ job_id }}"
-                        method="GET"
-                    >
-
-                        <button
-                            type="submit"
-                            class="green"
-                        >
-                            ▶ Continue Translation
-                        </button>
-
+                {% if job.translated_chapters < job.total_chapters and not job.running %}
+                    <form action="/translate/{{ job_id }}" method="GET">
+                        <button type="submit" class="green">▶ Continue Translation</button>
                     </form>
-
                 {% endif %}
-
 
                 {% if job.words > 0 %}
-
                     <div class="download-box">
-
-                        <a
-                            class="button green"
-                            href="/download/{{ job_id }}"
-                        >
+                        <a class="button green" href="/download/{{ job_id }}">
                             📥 Download Current EPUB ({{ "{:,}".format(job.words) }} words)
                         </a>
-
                     </div>
-
                 {% else %}
-
-                    <div class="small">
-                        🔒 Download unlocks once the first section finishes translating.
-                    </div>
-
+                    <div class="small">🔒 Download unlocks once the first section translates.</div>
                 {% endif %}
 
-
-                <form
-                    action="/delete/{{ job_id }}"
-                    method="POST"
-                    onsubmit="return confirm('Delete this novel?');"
-                >
-
-                    <button
-                        type="submit"
-                        class="danger"
-                    >
-                        🗑️ Delete Novel
-                    </button>
-
+                <form action="/delete/{{ job_id }}" method="POST" onsubmit="return confirm('Delete this novel?');">
+                    <button type="submit" class="danger">🗑️ Delete Novel</button>
                 </form>
 
             </div>
@@ -704,89 +517,45 @@ hr {
 def password_required():
     return bool(SITE_PASSWORD)
 
-
 def is_authenticated():
     if not password_required():
         return True
-
     return session.get("authenticated") is True
-
 
 @app.before_request
 def require_login():
-
-    allowed = {
-        "login",
-        "health",
-        "static"
-    }
-
+    allowed = {"login", "health", "static"}
     if request.endpoint in allowed:
         return None
-
     if not password_required():
         return None
-
     if not is_authenticated():
         if request.endpoint == "index":
             return None
-        return redirect(
-            url_for("index")
-        )
-
+        return redirect(url_for("index"))
     return None
-
 
 @app.route("/")
 def index():
-
-    authenticated = is_authenticated()
-
     return render_template_string(
         PAGE,
-        authenticated=authenticated,
+        authenticated=is_authenticated(),
         login_error=False,
         jobs=jobs
     )
 
-
 @app.route("/login", methods=["POST"])
 def login():
-
-    password = request.form.get(
-        "password",
-        ""
-    )
-
-    if (
-        SITE_PASSWORD
-        and secrets.compare_digest(
-            password,
-            SITE_PASSWORD
-        )
-    ):
+    password = request.form.get("password", "")
+    if SITE_PASSWORD and secrets.compare_digest(password, SITE_PASSWORD):
         session["authenticated"] = True
-
-        return redirect(
-            url_for("index")
-        )
-
-    return render_template_string(
-        PAGE,
-        authenticated=False,
-        login_error=True,
-        jobs={}
-    )
-
+        return redirect(url_for("index"))
+    return render_template_string(PAGE, authenticated=False, login_error=True, jobs={})
 
 @app.route("/lock", methods=["POST"])
 def lock():
-
     session.clear()
-
-    return redirect(
-        url_for("index")
-    )
+    return redirect(url_for("index"))
 
 
 # ============================================================
@@ -794,549 +563,204 @@ def lock():
 # ============================================================
 
 def clean_text(text):
-
-    text = text.replace(
-        "\r\n",
-        "\n"
-    )
-
-    text = text.replace(
-        "\r",
-        "\n"
-    )
-
-    text = text.replace(
-        "\x00",
-        ""
-    )
-
-    text = re.sub(
-        r"\n{4,}",
-        "\n\n\n",
-        text
-    )
-
-    return text.strip()
-
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    return re.sub(r"\n{4,}", "\n\n\n", text).strip()
 
 def count_words(text):
-
     if not text:
         return 0
-
-    # Counts both space-separated words (English) and CJK characters (Chinese/Japanese/Korean)
     cjk_count = len(re.findall(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', text))
     space_word_count = len(re.findall(r"\b[\w'-]+\b", re.sub(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', '', text)))
-
     return cjk_count + space_word_count
 
-
-def split_large_text(
-    text,
-    max_chars=MAX_CHARS_PER_REQUEST
-):
-
+def split_large_text(text, max_chars=MAX_CHARS_PER_REQUEST):
     text = clean_text(text)
-
     if not text:
         return []
-
     if len(text) <= max_chars:
         return [text]
 
     paragraphs = text.split("\n")
-
-    chunks = []
-
-    current = ""
+    chunks, current = [], ""
 
     for paragraph in paragraphs:
-
         paragraph = paragraph.strip()
-
         if not paragraph:
             continue
-
         if len(paragraph) > max_chars:
-
             if current:
-                chunks.append(
-                    current
-                )
+                chunks.append(current)
                 current = ""
-
             start = 0
-
             while start < len(paragraph):
-
-                end = min(
-                    start + max_chars,
-                    len(paragraph)
-                )
-
-                chunks.append(
-                    paragraph[start:end]
-                )
-
+                end = min(start + max_chars, len(paragraph))
+                chunks.append(paragraph[start:end])
                 start = end
-
             continue
 
-        candidate = (
-            current + "\n" + paragraph
-            if current
-            else paragraph
-        )
-
+        candidate = (current + "\n" + paragraph) if current else paragraph
         if len(candidate) > max_chars:
-
             if current:
-                chunks.append(
-                    current
-                )
-
+                chunks.append(current)
             current = paragraph
-
         else:
-
             current = candidate
 
     if current:
-        chunks.append(
-            current
-        )
+        chunks.append(current)
 
     return chunks
 
 
 # ============================================================
-# TXT PARSER
+# PARSERS
 # ============================================================
 
 def parse_txt(data):
-
-    encodings = [
-        "utf-8",
-        "utf-8-sig",
-        "gb18030",
-        "gbk",
-        "big5"
-    ]
-
+    encodings = ["utf-8", "utf-8-sig", "gb18030", "gbk", "big5"]
     text = None
-
     for encoding in encodings:
-
         try:
-
-            text = data.decode(
-                encoding
-            )
-
+            text = data.decode(encoding)
             break
-
         except UnicodeDecodeError:
             continue
 
     if text is None:
-
-        raise ValueError(
-            "Could not decode TXT file. "
-            "Please save it as UTF-8."
-        )
+        raise ValueError("Could not decode TXT file. Please save it as UTF-8.")
 
     text = clean_text(text)
-
-    pattern = re.compile(
-        r"(?im)^(第\s*[0-9一二三四五六七八九十百千万两零]+\s*[章回节]|"
-        r"chapter\s+\d+.*)$"
-    )
-
-    matches = list(
-        pattern.finditer(text)
-    )
-
+    pattern = re.compile(r"(?im)^(第\s*[0-9一二三四五六七八九十百千万两零]+\s*[章回节]|chapter\s+\d+.*)$")
+    matches = list(pattern.finditer(text))
     chapters = []
 
     if matches:
-
         for i, match in enumerate(matches):
-
             start = match.start()
-
-            if i + 1 < len(matches):
-
-                end = matches[
-                    i + 1
-                ].start()
-
-            else:
-
-                end = len(text)
-
-            chapter_text = text[
-                start:end
-            ].strip()
-
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            chapter_text = text[start:end].strip()
             if chapter_text:
-
-                chapters.append(
-                    chapter_text
-                )
-
+                chapters.append(chapter_text)
     else:
-
-        chunks = split_large_text(
-            text,
-            max_chars=MAX_CHARS_PER_REQUEST
-        )
-
+        chunks = split_large_text(text, max_chars=MAX_CHARS_PER_REQUEST)
         for i, chunk in enumerate(chunks):
-
-            chapters.append(
-                "Chapter "
-                + str(i + 1)
-                + "\n\n"
-                + chunk
-            )
+            chapters.append(f"Chapter {i + 1}\n\n{chunk}")
 
     if not chapters:
-
-        raise ValueError(
-            "No chapters were found."
-        )
-
+        raise ValueError("No chapters were found.")
     return chapters
 
 
-# ============================================================
-# EPUB PARSER
-# ============================================================
-
 def parse_epub(data):
-
     chapters = []
-
-    with zipfile.ZipFile(
-        io.BytesIO(data)
-    ) as z:
-
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
         names = z.namelist()
-
-        html_files = [
-            n
-            for n in names
-            if n.lower().endswith(
-                (
-                    ".xhtml",
-                    ".html",
-                    ".htm"
-                )
-            )
-        ]
-
+        html_files = [n for n in names if n.lower().endswith((".xhtml", ".html", ".htm"))]
         for filename in html_files:
-
             try:
-
-                raw = z.read(
-                    filename
-                ).decode(
-                    "utf-8",
-                    errors="ignore"
-                )
-
+                raw = z.read(filename).decode("utf-8", errors="ignore")
             except Exception:
-
                 continue
 
-            raw = re.sub(
-                r"<script.*?</script>",
-                "",
-                raw,
-                flags=re.I | re.S
-            )
-
-            raw = re.sub(
-                r"<style.*?</style>",
-                "",
-                raw,
-                flags=re.I | re.S
-            )
-
-            raw = re.sub(
-                r"</(p|div|br|h1|h2|h3|h4|li|section)>",
-                "\n",
-                raw,
-                flags=re.I
-            )
-
-            raw = re.sub(
-                r"<[^>]+>",
-                "",
-                raw
-            )
-
-            raw = html.unescape(
-                raw
-            )
-
-            text = clean_text(
-                raw
-            )
-
+            raw = re.sub(r"<script.*?</script>", "", raw, flags=re.I | re.S)
+            raw = re.sub(r"<style.*?</style>", "", raw, flags=re.I | re.S)
+            raw = re.sub(r"</(p|div|br|h1|h2|h3|h4|li|section)>", "\n", raw, flags=re.I)
+            raw = re.sub(r"<[^>]+>", "", raw)
+            raw = html.unescape(raw)
+            text = clean_text(raw)
             if len(text) < 100:
                 continue
 
-            parts = split_large_text(
-                text,
-                max_chars=MAX_CHARS_PER_REQUEST
-            )
-
-            chapters.extend(
-                parts
-            )
+            parts = split_large_text(text, max_chars=MAX_CHARS_PER_REQUEST)
+            chapters.extend(parts)
 
     if not chapters:
-
-        raise ValueError(
-            "No readable chapters were found in the EPUB."
-        )
-
+        raise ValueError("No readable chapters were found in the EPUB.")
     return chapters
 
 
-# ============================================================
-# FILE PARSER
-# ============================================================
-
-def parse_uploaded_file(
-    filename,
-    data
-):
-
+def parse_uploaded_file(filename, data):
     lower = filename.lower()
-
     if lower.endswith(".txt"):
-
-        return parse_txt(
-            data
-        )
-
+        return parse_txt(data)
     if lower.endswith(".epub"):
-
-        return parse_epub(
-            data
-        )
-
-    raise ValueError(
-        "Only TXT and EPUB files are supported."
-    )
+        return parse_epub(data)
+    raise ValueError("Only TXT and EPUB files are supported.")
 
 
 # ============================================================
-# TRANSLATION PROMPT
+# TRANSLATION PROMPT & APIS
 # ============================================================
 
 def make_translation_prompt(text):
-
-    return f"""
-You are a professional Chinese-to-English web novel translator.
-
+    return f"""You are a professional Chinese-to-English web novel translator.
 Translate the Chinese text below into natural, fluent English.
 
 IMPORTANT RULES:
-
-1. Translate EVERYTHING.
-2. Do NOT summarize.
-3. Do NOT omit sentences.
-4. Do NOT skip dialogue.
-5. Do NOT shorten the story.
-6. Preserve all story details.
-7. Preserve the original meaning.
-8. Keep character names consistent.
-9. Keep character genders and pronouns consistent.
-10. Preserve paragraph breaks when possible.
-11. Preserve dialogue formatting.
-12. Do not add explanations.
-13. Do not add translator notes.
-14. Output ONLY the English translation.
-15. Do not say "Here is the translation".
-16. Do not use Markdown code blocks.
-17. Do not discuss these instructions.
+1. Translate EVERYTHING. Do NOT summarize or omit sentences.
+2. Preserve all story details, character names, and pronouns.
+3. Keep dialogue formatting and paragraph breaks consistent.
+4. Output ONLY the English translation without translator notes or code blocks.
 
 Chinese text:
 
-{text}
-"""
+{text}"""
 
-
-# ============================================================
-# GEMINI TRANSLATION
-# ============================================================
 
 def translate_with_gemini(text):
-
     if not gemini_client:
-
-        raise RuntimeError(
-            "Gemini API client is unavailable."
-        )
-
-    prompt = make_translation_prompt(
-        text
-    )
-
+        raise RuntimeError("Gemini API client is unavailable.")
+    prompt = make_translation_prompt(text)
     last_error = None
 
     for attempt in range(MAX_RETRIES):
-
         try:
-
-            response = (
-                gemini_client
-                .models
-                .generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.2
-                    )
-                )
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.2)
             )
+            translated = getattr(response, "text", None)
+            if translated and translated.strip():
+                return translated.strip()
 
-            translated = getattr(
-                response,
-                "text",
-                None
-            )
-
-            if translated:
-
-                translated = (
-                    translated
-                    .strip()
-                )
-
-                if translated:
-
-                    return translated
-
-            candidates = getattr(
-                response,
-                "candidates",
-                None
-            )
-
+            candidates = getattr(response, "candidates", None)
             if candidates:
-
                 pieces = []
-
                 for candidate in candidates:
-
-                    content = getattr(
-                        candidate,
-                        "content",
-                        None
-                    )
-
+                    content = getattr(candidate, "content", None)
                     if not content:
                         continue
-
-                    parts = getattr(
-                        content,
-                        "parts",
-                        []
-                    )
-
+                    parts = getattr(content, "parts", [])
                     for part in parts:
-
-                        part_text = getattr(
-                            part,
-                            "text",
-                            None
-                        )
-
-                        if part_text:
-
-                            pieces.append(
-                                part_text
-                            )
-
+                        pt = getattr(part, "text", None)
+                        if pt:
+                            pieces.append(pt)
                 if pieces:
-
-                    translated = (
-                        "\n".join(
-                            pieces
-                        )
-                        .strip()
-                    )
-
-                    if translated:
-
-                        return translated
-
-            raise RuntimeError(
-                "Gemini returned no translation text."
-            )
+                    return "\n".join(pieces).strip()
+            raise RuntimeError("Gemini returned no translation text.")
 
         except Exception as e:
-
             last_error = e
-
             err_str = str(e)
-
-            print(
-                f"GEMINI ERROR (Attempt {attempt + 1}/{MAX_RETRIES}):",
-                repr(e)
-            )
-
+            print(f"GEMINI ERROR (Attempt {attempt + 1}/{MAX_RETRIES}):", repr(e))
             if attempt < MAX_RETRIES - 1:
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    sleep_time = (2 ** attempt) * 3
-                    print(f"Gemini server load spike. Retrying in {sleep_time} seconds...")
-                    time.sleep(sleep_time)
-                else:
-                    time.sleep(2 ** attempt)
+                sleep_time = (2 ** attempt) * 3 if ("503" in err_str or "429" in err_str) else (2 ** attempt)
+                time.sleep(sleep_time)
 
-    raise RuntimeError(
-        "Gemini unavailable or quota exhausted.\n\n"
-        + str(last_error)
-    )
+    raise RuntimeError(f"Gemini unavailable or quota exhausted.\n\n{last_error}")
 
 
-# ============================================================
-# OPENROUTER TRANSLATION (FAST FREE ROTATION)
-# ============================================================
-
-def translate_with_openrouter(
-    text,
-    preferred_model=None
-):
-
+def translate_with_openrouter(text, preferred_model=None):
     if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing.")
 
-        raise RuntimeError(
-            "OPENROUTER_API_KEY is missing."
-        )
-
-    prompt = make_translation_prompt(
-        text
-    )
-
+    prompt = make_translation_prompt(text)
     headers = {
-        "Authorization":
-            "Bearer "
-            + OPENROUTER_API_KEY,
-
-        "Content-Type":
-            "application/json",
-
-        "HTTP-Referer":
-            "https://novel-translator.onrender.com",
-
-        "X-Title":
-            "Free Novel Translator"
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://novel-translator.onrender.com",
+        "X-Title": "Free Novel Translator"
     }
 
     models_to_try = FREE_FALLBACK_MODELS.copy()
@@ -1344,136 +768,57 @@ def translate_with_openrouter(
         models_to_try.insert(0, preferred_model)
 
     last_error = None
-
     for target_model in models_to_try:
-
         payload = {
             "model": target_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2
         }
-
         try:
-
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=OPENROUTER_TIMEOUT
             )
-
             if response.status_code == 200:
-
                 data = response.json()
-
-                choices = data.get(
-                    "choices",
-                    []
-                )
-
+                choices = data.get("choices", [])
                 if choices:
-
-                    translated = (
-                        choices[0]
-                        .get("message", {})
-                        .get("content", "")
-                        .strip()
-                    )
-
+                    translated = choices[0].get("message", {}).get("content", "").strip()
                     if translated:
-
-                        actual_model = data.get(
-                            "model",
-                            target_model
-                        )
-
-                        return (
-                            translated,
-                            actual_model
-                        )
-
+                        actual_model = data.get("model", target_model)
+                        return translated, actual_model
         except Exception as e:
-
-            print(
-                f"OpenRouter model {target_model} failed or timed out: {e}"
-            )
-
+            print(f"OpenRouter model {target_model} failed/timed out: {e}")
             last_error = e
 
-    raise RuntimeError(
-        "All free OpenRouter fallback models are currently busy.\n\n"
-        + str(last_error)
-    )
+    raise RuntimeError(f"All free OpenRouter fallback models are currently busy.\n\n{last_error}")
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM & HELPERS
 # ============================================================
 
 def send_telegram(message):
-
-    if not TELEGRAM_BOT_TOKEN:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-
-    if not TELEGRAM_CHAT_ID:
-        return
-
     try:
-
         requests.post(
-            "https://api.telegram.org/bot"
-            + TELEGRAM_BOT_TOKEN
-            + "/sendMessage",
-
-            data={
-                "chat_id":
-                    TELEGRAM_CHAT_ID,
-
-                "text":
-                    message
-            },
-
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
             timeout=15
         )
-
     except Exception as e:
-
-        print(
-            "Telegram notification error:",
-            repr(e)
-        )
-
-
-# ============================================================
-# JOB HELPERS
-# ============================================================
+        print("Telegram error:", repr(e))
 
 def get_job(job_id):
-
     with jobs_lock:
-
-        return jobs.get(
-            job_id
-        )
-
+        return jobs.get(job_id)
 
 def calculate_job_words(job):
-
-    combined = "\n\n".join(
-        job.get(
-            "translations",
-            []
-        )
-    )
-
-    return count_words(
-        combined
-    )
+    combined = "\n\n".join(job.get("translations", []))
+    return count_words(combined)
 
 
 # ============================================================
@@ -1481,763 +826,217 @@ def calculate_job_words(job):
 # ============================================================
 
 def translation_worker(job_id):
-
-    job = get_job(
-        job_id
-    )
-
+    job = get_job(job_id)
     if not job:
         return
 
     try:
-
         job["running"] = True
         job["error"] = None
+        total = len(job["chapters"])
 
-        total = len(
-            job["chapters"]
-        )
-
-        while (
-            job["translated_chapters"]
-            < total
-        ):
-
-            index = job[
-                "translated_chapters"
-            ]
-
-            original_chapter = job[
-                "chapters"
-            ][index]
-
-            pieces = split_large_text(
-                original_chapter,
-                MAX_CHARS_PER_REQUEST
-            )
-
+        while job["translated_chapters"] < total:
+            index = job["translated_chapters"]
+            original_chapter = job["chapters"][index]
+            pieces = split_large_text(original_chapter, MAX_CHARS_PER_REQUEST)
             translated_pieces = []
 
-            for piece_number, piece in enumerate(
-                pieces
-            ):
-
-                job["status"] = (
-                    "Translating section "
-                    + str(index + 1)
-                    + "/"
-                    + str(total)
-                    + " - part "
-                    + str(piece_number + 1)
-                    + "/"
-                    + str(len(pieces))
-                    + "..."
-                )
+            for piece_number, piece in enumerate(pieces):
+                job["status"] = f"Translating section {index + 1}/{total} (part {piece_number + 1}/{len(pieces)})..."
 
                 if job["provider"] == "gemini":
-
                     try:
-
-                        translated = (
-                            translate_with_gemini(
-                                piece
-                            )
-                        )
-
+                        translated = translate_with_gemini(piece)
                     except Exception as gemini_error:
-
-                        print(
-                            "Gemini failed or timed out."
-                        )
-
                         if OPENROUTER_API_KEY:
-                            print("Switching job to OpenRouter fallback.")
-
-                            job["provider"] = "openrouter_qwen"
-                            job["provider_model"] = None
-
-                            job["status"] = (
-                                "Gemini server demand spike hit limit. "
-                                "Switched to FREE OpenRouter fallback."
-                            )
-
-                            send_telegram(
-                                "Novel Translator:\n\n"
-                                + job["filename"]
-                                + "\n\n"
-                                "Gemini spike hit limit. "
-                                "Switched to FREE OpenRouter."
-                            )
-
-                            translated, actual_model = (
-                                translate_with_openrouter(
-                                    piece
-                                )
-                            )
-
+                            print("Gemini limit hit. Falling back to OpenRouter.")
+                            job["provider"] = "openrouter_free"
+                            job["provider_model"] = "openrouter/free"
+                            translated, actual_model = translate_with_openrouter(piece)
                             job["provider_model"] = actual_model
                         else:
                             raise gemini_error
-
                 else:
-
-                    translated, actual_model = (
-                        translate_with_openrouter(
-                            piece,
-                            preferred_model=job.get(
-                                "provider_model"
-                            )
-                        )
+                    translated, actual_model = translate_with_openrouter(
+                        piece, 
+                        preferred_model=job.get("provider_model")
                     )
+                    job["provider_model"] = actual_model
 
-                    job[
-                        "provider_model"
-                    ] = actual_model
+                translated_pieces.append(translated)
+                time.sleep(REQUEST_DELAY)
 
-                translated_pieces.append(
-                    translated
-                )
+            final_translation = "\n\n".join(translated_pieces).strip()
+            job["translations"].append(final_translation)
+            job["translated_chapters"] += 1
+            job["words"] = calculate_job_words(job)
+            job["percent"] = int((job["translated_chapters"] / total) * 100)
 
-                time.sleep(
-                    REQUEST_DELAY
-                )
+            model_display = job.get("provider_model")
+            provider_text = "Gemini 2.5 Flash" if job["provider"] == "gemini" else f"OpenRouter FREE ({model_display})"
+            job["status"] = f"Completed section {job['translated_chapters']}/{total}. {job['words']} words. Active: {provider_text}."
 
-            final_translation = (
-                "\n\n".join(
-                    translated_pieces
-                )
-                .strip()
-            )
-
-            job[
-                "translations"
-            ].append(
-                final_translation
-            )
-
-            job[
-                "translated_chapters"
-            ] += 1
-
-            job[
-                "words"
-            ] = calculate_job_words(
-                job
-            )
-
-            job[
-                "percent"
-            ] = int(
-                (
-                    job[
-                        "translated_chapters"
-                    ]
-                    /
-                    total
-                )
-                * 100
-            )
-
-            model_display = job.get(
-                "provider_model"
-            )
-
-            if job["provider"] == "gemini":
-
-                provider_text = (
-                    "Gemini 2.5 Flash"
-                )
-
-            else:
-
-                provider_text = (
-                    "OpenRouter FREE"
-                )
-
-                if model_display:
-                    provider_text += (
-                        " ("
-                        + model_display
-                        + ")"
-                    )
-
-            job["status"] = (
-                "Completed section "
-                + str(
-                    job[
-                        "translated_chapters"
-                    ]
-                )
-                + "/"
-                + str(total)
-                + ". "
-                + str(
-                    job[
-                        "words"
-                    ]
-                )
-                + " English words. "
-                + provider_text
-                + "."
-            )
-
-        job["status"] = (
-            "Translation complete!"
-        )
-
+        job["status"] = "Translation complete!"
         job["running"] = False
-
-        send_telegram(
-            "Novel Translator:\n\n"
-            + job["filename"]
-            + "\n\n"
-            "Translation complete.\n"
-            + str(job["words"])
-            + " English words."
-        )
+        send_telegram(f"Novel Translator:\n\n{job['filename']}\n\nTranslation complete.\n{job['words']} English words.")
 
     except Exception as e:
-
-        print(
-            "TRANSLATION WORKER ERROR:",
-            repr(e)
-        )
-
-        job["error"] = str(
-            e
-        )
-
-        job["status"] = (
-            "Translation stopped."
-        )
-
+        print("TRANSLATION WORKER ERROR:", repr(e))
+        job["error"] = str(e)
+        job["status"] = "Translation stopped."
         job["running"] = False
-
-        send_telegram(
-            "Novel Translator ERROR:\n\n"
-            + job["filename"]
-            + "\n\n"
-            + str(e)
-        )
+        send_telegram(f"Novel Translator ERROR:\n\n{job['filename']}\n\n{e}")
 
 
 # ============================================================
-# UPLOAD
+# ROUTES
 # ============================================================
 
-@app.route(
-    "/upload",
-    methods=["POST"]
-)
+@app.route("/upload", methods=["POST"])
 def upload():
+    uploaded = request.files.get("file")
+    chosen_model = request.form.get("model_choice", "gemini")
 
-    uploaded = request.files.get(
-        "file"
-    )
-
-    if not uploaded:
-
-        return redirect(
-            url_for("index")
-        )
-
-    if not uploaded.filename:
-
-        return redirect(
-            url_for("index")
-        )
+    if not uploaded or not uploaded.filename:
+        return redirect(url_for("index"))
 
     try:
-
         data = uploaded.read()
-
-        chapters = parse_uploaded_file(
-            uploaded.filename,
-            data
-        )
-
-        # Calculate original word/character count across all chapters
+        chapters = parse_uploaded_file(uploaded.filename, data)
         original_words = sum(count_words(ch) for ch in chapters)
+        job_id = str(uuid.uuid4())
 
-        job_id = str(
-            uuid.uuid4()
-        )
+        provider = "gemini" if chosen_model == "gemini" else "openrouter_free"
+        provider_model = None if chosen_model == "gemini" else chosen_model
 
         jobs[job_id] = {
-
-            "id":
-                job_id,
-
-            "filename":
-                uploaded.filename,
-
-            "chapters":
-                chapters,
-
-            "original_words":
-                original_words,
-
-            "translations":
-                [],
-
-            "translated_chapters":
-                0,
-
-            "total_chapters":
-                len(chapters),
-
-            "words":
-                0,
-
-            "percent":
-                0,
-
-            "status":
-                "Uploaded. Ready to translate.",
-
-            "error":
-                None,
-
-            "running":
-                False,
-
-            "provider":
-                "gemini",
-
-            "provider_model":
-                None
+            "id": job_id,
+            "filename": uploaded.filename,
+            "chapters": chapters,
+            "original_words": original_words,
+            "translations": [],
+            "translated_chapters": 0,
+            "total_chapters": len(chapters),
+            "words": 0,
+            "percent": 0,
+            "status": "Uploaded. Ready to translate.",
+            "error": None,
+            "running": False,
+            "provider": provider,
+            "provider_model": provider_model
         }
 
-        print(
-            "Uploaded "
-            + uploaded.filename
-            + ": "
-            + str(len(chapters))
-            + " chapters, "
-            + str(original_words)
-            + " original words"
-        )
-
-        return redirect(
-            url_for("index")
-        )
+        return redirect(url_for("index"))
 
     except Exception as e:
-
-        return (
-            "<h2>Upload Error</h2>"
-            "<p>"
-            + html.escape(
-                str(e)
-            )
-            + "</p>"
-            "<p><a href='/'>Go back</a></p>"
-        )
+        return f"<h2>Upload Error</h2><p>{html.escape(str(e))}</p><p><a href='/'>Go back</a></p>"
 
 
-# ============================================================
-# START / CONTINUE TRANSLATION
-# ============================================================
-
-@app.route(
-    "/translate/<job_id>"
-)
+@app.route("/translate/<job_id>")
 def translate(job_id):
-
-    job = get_job(
-        job_id
-    )
-
-    if not job:
-
-        return redirect(
-            url_for("index")
-        )
-
-    if job["running"]:
-
-        return redirect(
-            url_for("index")
-        )
-
-    if (
-        job["translated_chapters"]
-        >= job["total_chapters"]
-    ):
-
-        return redirect(
-            url_for("index")
-        )
+    job = get_job(job_id)
+    if not job or job["running"] or job["translated_chapters"] >= job["total_chapters"]:
+        return redirect(url_for("index"))
 
     job["error"] = None
-
-    thread = threading.Thread(
-        target=translation_worker,
-        args=(job_id,),
-        daemon=True
-    )
-
+    thread = threading.Thread(target=translation_worker, args=(job_id,), daemon=True)
     thread.start()
-
-    return redirect(
-        url_for("index")
-    )
+    return redirect(url_for("index"))
 
 
-# ============================================================
-# DOWNLOAD
-# ============================================================
-
-@app.route(
-    "/download/<job_id>"
-)
+@app.route("/download/<job_id>")
 def download(job_id):
-
-    job = get_job(
-        job_id
-    )
-
-    if not job:
-
-        return redirect(
-            url_for("index")
-        )
-
-    if not job["translations"]:
-
-        return (
-            "Nothing has been translated yet."
-        )
+    job = get_job(job_id)
+    if not job or not job["translations"]:
+        return "Nothing has been translated yet."
 
     try:
-
-        epub_bytes = create_epub(
-            job["filename"],
-            job["translations"]
-        )
-
-        base_name = os.path.splitext(
-            job["filename"]
-        )[0]
-
-        output_name = (
-            base_name
-            + "_translated.epub"
-        )
-
+        epub_bytes = create_epub(job["filename"], job["translations"])
+        base_name = os.path.splitext(job["filename"])[0]
         return send_file(
-            io.BytesIO(
-                epub_bytes
-            ),
-
-            mimetype=
-                "application/epub+zip",
-
+            io.BytesIO(epub_bytes),
+            mimetype="application/epub+zip",
             as_attachment=True,
-
-            download_name=
-                output_name
+            download_name=f"{base_name}_translated.epub"
         )
-
     except Exception as e:
-
-        return (
-            "<h2>EPUB creation error</h2>"
-            "<p>"
-            + html.escape(
-                str(e)
-            )
-            + "</p>"
-            "<p><a href='/'>Go back</a></p>"
-        )
+        return f"<h2>EPUB creation error</h2><p>{html.escape(str(e))}</p><p><a href='/'>Go back</a></p>"
 
 
-# ============================================================
-# EPUB CREATOR
-# ============================================================
-
-def create_epub(
-    filename,
-    translations
-):
-
-    base_name = os.path.splitext(
-        filename
-    )[0]
-
-    book_title = (
-        base_name
-        + " - English Translation"
-    )
-
+def create_epub(filename, translations):
+    base_name = os.path.splitext(filename)[0]
+    book_title = f"{base_name} - English Translation"
     buf = io.BytesIO()
 
-    with zipfile.ZipFile(
-        buf,
-        "w",
-        zipfile.ZIP_DEFLATED
-    ) as epub:
-
-        epub.writestr(
-            "mimetype",
-            "application/epub+zip",
-            compress_type=zipfile.ZIP_STORED
-        )
-
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as epub:
+        epub.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
         epub.writestr(
             "META-INF/container.xml",
             """<?xml version="1.0" encoding="UTF-8"?>
-<container version="1.0"
-xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
 <rootfiles>
-<rootfile
-full-path="OEBPS/content.opf"
-media-type="application/oebps-package+xml"/>
+<rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
 </rootfiles>
 </container>"""
         )
 
-        manifest_items = []
+        manifest_items, spine_items = [], []
 
-        spine_items = []
-
-        for i, translation in enumerate(
-            translations
-        ):
-
-            chapter_filename = (
-                "chapter"
-                + str(i + 1)
-                + ".xhtml"
-            )
-
-            title = (
-                "Chapter "
-                + str(i + 1)
-            )
-
-            safe_translation = html.escape(
-                translation
-            )
-
-            paragraphs = (
-                safe_translation.split(
-                    "\n"
-                )
-            )
-
-            body = ""
-
-            for paragraph in paragraphs:
-
-                paragraph = (
-                    paragraph.strip()
-                )
-
-                if paragraph:
-
-                    body += (
-                        "<p>"
-                        + paragraph
-                        + "</p>\n"
-                    )
+        for i, translation in enumerate(translations):
+            chapter_filename = f"chapter{i + 1}.xhtml"
+            title = f"Chapter {i + 1}"
+            safe_translation = html.escape(translation)
+            paragraphs = safe_translation.split("\n")
+            body = "".join(f"<p>{p.strip()}</p>\n" for p in paragraphs if p.strip())
 
             chapter_html = (
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                "\n"
-                '<!DOCTYPE html>'
-                "\n"
-                '<html xmlns="http://www.w3.org/1999/xhtml">'
-                "\n"
-                "<head>"
-                "\n"
-                '<meta charset="UTF-8"/>'
-                "\n"
-                "<title>"
-                + html.escape(title)
-                + "</title>"
-                "\n"
-                "</head>"
-                "\n"
-                "<body>"
-                "\n"
-                "<h2>"
-                + html.escape(title)
-                + "</h2>"
-                "\n"
-                + body
-                + "</body>"
-                "\n"
-                "</html>"
+                '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE html>\n'
+                '<html xmlns="http://www.w3.org/1999/xhtml">\n<head>\n'
+                f'<meta charset="UTF-8"/><title>{html.escape(title)}</title>\n'
+                f'</head>\n<body>\n<h2>{html.escape(title)}</h2>\n{body}</body>\n</html>'
             )
 
-            epub.writestr(
-                "OEBPS/"
-                + chapter_filename,
-                chapter_html
-            )
+            epub.writestr(f"OEBPS/{chapter_filename}", chapter_html)
+            manifest_items.append(f'<item id="chapter{i + 1}" href="{chapter_filename}" media-type="application/xhtml+xml"/>')
+            spine_items.append(f'<itemref idref="chapter{i + 1}"/>')
 
-            manifest_items.append(
-                '<item id="chapter'
-                + str(i + 1)
-                + '" href="'
-                + chapter_filename
-                + '" media-type="application/xhtml+xml"/>'
-            )
+        css = "body { font-family: serif; line-height: 1.6; margin: 5%; }\nh1, h2 { text-align: center; }\np { text-indent: 1.5em; margin-bottom: 1em; }"
+        epub.writestr("OEBPS/style.css", css)
 
-            spine_items.append(
-                '<itemref idref="chapter'
-                + str(i + 1)
-                + '"/>'
-            )
-
-        css = """
-body {
-    font-family: serif;
-    line-height: 1.6;
-    margin: 5%;
-}
-
-h1, h2 {
-    text-align: center;
-}
-
-p {
-    text-indent: 1.5em;
-    margin-bottom: 1em;
-}
-"""
-
-        epub.writestr(
-            "OEBPS/style.css",
-            css
-        )
-
-        manifest = "\n".join(
-            manifest_items
-        )
-
-        spine = "\n".join(
-            spine_items
-        )
-
+        manifest = "\n".join(manifest_items)
+        spine = "\n".join(spine_items)
         opf = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            "\n"
-            '<package version="3.0" '
-            'xmlns="http://www.idpf.org/2007/opf" '
-            'unique-identifier="BookID">'
-            "\n"
-            '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
-            "\n"
-            '<dc:identifier id="BookID">'
-            + str(uuid.uuid4())
-            + "</dc:identifier>"
-            "\n"
-            "<dc:title>"
-            + html.escape(book_title)
-            + "</dc:title>"
-            "\n"
-            "<dc:language>en</dc:language>"
-            "\n"
-            "<dc:creator>Free Novel Translator</dc:creator>"
-            "\n"
-            "</metadata>"
-            "\n"
-            "<manifest>"
-            "\n"
-            '<item id="style" href="style.css" media-type="text/css"/>'
-            "\n"
-            + manifest
-            + "\n"
-            "</manifest>"
-            "\n"
-            "<spine>"
-            "\n"
-            + spine
-            + "\n"
-            "</spine>"
-            "\n"
-            "</package>"
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<package version="3.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookID">\n'
+            f'<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n<dc:identifier id="BookID">{uuid.uuid4()}</dc:identifier>\n'
+            f'<dc:title>{html.escape(book_title)}</dc:title>\n<dc:language>en</dc:language>\n'
+            '<dc:creator>Free Novel Translator</dc:creator>\n</metadata>\n'
+            f'<manifest>\n<item id="style" href="style.css" media-type="text/css"/>\n{manifest}\n</manifest>\n'
+            f'<spine>\n{spine}\n</spine>\n</package>'
         )
-
-        epub.writestr(
-            "OEBPS/content.opf",
-            opf
-        )
+        epub.writestr("OEBPS/content.opf", opf)
 
     return buf.getvalue()
 
 
-# ============================================================
-# DELETE
-# ============================================================
-
-@app.route(
-    "/delete/<job_id>",
-    methods=["POST"]
-)
+@app.route("/delete/<job_id>", methods=["POST"])
 def delete(job_id):
+    jobs.pop(job_id, None)
+    return redirect(url_for("index"))
 
-    if job_id in jobs:
-
-        del jobs[job_id]
-
-    return redirect(
-        url_for("index")
-    )
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
 
 @app.route("/health")
 def health():
-
     return {
-
-        "status":
-            "ok",
-
-        "gemini_configured":
-            bool(
-                GEMINI_API_KEY
-            ),
-
-        "openrouter_configured":
-            bool(
-                OPENROUTER_API_KEY
-            ),
-
-        "password_enabled":
-            bool(
-                SITE_PASSWORD
-            ),
-
-        "gemini_model":
-            GEMINI_MODEL,
-
-        "openrouter_mode":
-            "Multi-model free rotation"
+        "status": "ok",
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "openrouter_configured": bool(OPENROUTER_API_KEY),
+        "password_enabled": bool(SITE_PASSWORD),
+        "gemini_model": GEMINI_MODEL,
+        "openrouter_mode": "Multi-model selection enabled"
     }
 
 
-# ============================================================
-# SERVER
-# ============================================================
-
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "10000"
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False
-    )
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
