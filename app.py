@@ -89,25 +89,28 @@ TELEGRAM_CHAT_ID = os.environ.get(
 # MODEL CONFIGURATION
 # ============================================================
 
+# High-speed production model that stays within Google's free tier
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
-    "gemini-3.6-flash"
+    "gemini-2.5-flash"
 ).strip()
 
 OPENROUTER_FREE_ROUTER = "openrouter/free"
 
 
 # ============================================================
-# TRANSLATION SETTINGS (OPTIMIZED FOR SPEED)
+# TRANSLATION SETTINGS (MAXIMIZED FOR SPEED & STABILITY)
 # ============================================================
 
-MAX_CHARS_PER_REQUEST = 12000
+# Maximize chunk size so fewer API calls are needed to complete the novel
+MAX_CHARS_PER_REQUEST = 20000
 
-REQUEST_DELAY = 1.0
+# Optimal delay (seconds) to respect Gemini free limits (10 RPM) & stop 503 spikes
+REQUEST_DELAY = 5.0
 
 MAX_RETRIES = 5
 
-OPENROUTER_TIMEOUT = 120
+OPENROUTER_TIMEOUT = 45
 
 GEMINI_TIMEOUT = 120
 
@@ -143,7 +146,7 @@ jobs_lock = threading.Lock()
 
 
 # ============================================================
-# OPENROUTER STATE
+# OPENROUTER STATE & ROTATION
 # ============================================================
 
 openrouter_model_cache = {
@@ -152,6 +155,14 @@ openrouter_model_cache = {
 }
 
 OPENROUTER_MODEL_CACHE_SECONDS = 300
+
+# Fast free fallback models on OpenRouter
+FREE_FALLBACK_MODELS = [
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "google/gemma-4-31b:free",
+    "qwen/qwen-2.5-7b-instruct:free",
+    "openrouter/free"
+]
 
 
 # ============================================================
@@ -433,38 +444,22 @@ hr {
 
     <div class="notice">
 
-        <strong>Translation system</strong>
+        <strong>Translation System (Speed Optimized & 100% Free)</strong>
 
         <p>
-            1. Gemini is tried first.
+            1. Gemini 2.5 Flash is tried first for top speed and minimal quota limits.
         </p>
 
         <p>
-            2. If Gemini is exhausted or unavailable,
-            OpenRouter automatically takes over.
+            2. Large 20k character chunks speed up processing.
         </p>
 
         <p>
-            3. OpenRouter uses a FREE Qwen model whenever
-            one is currently available.
+            3. Instant EPUB download unlocks as soon as the first English text translates.
         </p>
 
         <p>
-            4. If no free Qwen model is available,
-            the official OpenRouter FREE router is used.
-        </p>
-
-        <p>
-            5. Once a novel switches to OpenRouter,
-            that novel stays on OpenRouter.
-        </p>
-
-        <p>
-            6. Translation is cumulative.
-        </p>
-
-        <p>
-            7. Download becomes available as soon as any text is translated.
+            4. If Gemini spikes, OpenRouter multi-model free rotation takes over seamlessly.
         </p>
 
     </div>
@@ -521,13 +516,13 @@ hr {
                 {% if job.provider == "gemini" %}
 
                     <span class="badge gemini">
-                        🤖 Gemini
+                        🤖 Gemini 2.5 Flash
                     </span>
 
                 {% elif job.provider == "openrouter_qwen" %}
 
                     <span class="badge qwen">
-                        🤖 OpenRouter Qwen
+                        🤖 OpenRouter Free Fallback
                     </span>
 
                 {% elif job.provider == "openrouter_free" %}
@@ -653,7 +648,7 @@ hr {
                 {% else %}
 
                     <div class="small">
-                        🔒 Download unlocks once the first chapter/section finishes translating.
+                        🔒 Download unlocks once the first section finishes translating.
                     </div>
 
                 {% endif %}
@@ -1284,8 +1279,8 @@ def translate_with_gemini(text):
 
             if attempt < MAX_RETRIES - 1:
                 if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    sleep_time = (2 ** attempt) * 3
-                    print(f"Gemini server load spike (503/429). Retrying in {sleep_time} seconds...")
+                    sleep_time = (2 ** attempt) * 4
+                    print(f"Gemini server load spike. Retrying in {sleep_time} seconds...")
                     time.sleep(sleep_time)
                 else:
                     time.sleep(2 ** attempt)
@@ -1297,176 +1292,7 @@ def translate_with_gemini(text):
 
 
 # ============================================================
-# OPENROUTER MODEL DISCOVERY
-# ============================================================
-
-def get_free_qwen_model():
-
-    if not OPENROUTER_API_KEY:
-
-        return None
-
-    now = time.time()
-
-    cached_model = openrouter_model_cache.get(
-        "model"
-    )
-
-    cached_time = openrouter_model_cache.get(
-        "time",
-        0
-    )
-
-    if (
-        cached_model
-        and now - cached_time
-        < OPENROUTER_MODEL_CACHE_SECONDS
-    ):
-
-        return cached_model
-
-    headers = {
-        "Authorization":
-            "Bearer "
-            + OPENROUTER_API_KEY,
-
-        "Content-Type":
-            "application/json"
-    }
-
-    try:
-
-        response = requests.get(
-            "https://openrouter.ai/api/v1/models",
-            headers=headers,
-            timeout=30
-        )
-
-        response.raise_for_status()
-
-        payload = response.json()
-
-        models = payload.get(
-            "data",
-            []
-        )
-
-        free_qwen = []
-
-        for model in models:
-
-            model_id = str(
-                model.get(
-                    "id",
-                    ""
-                )
-            )
-
-            name = str(
-                model.get(
-                    "name",
-                    ""
-                )
-            )
-
-            model_lower = model_id.lower()
-            name_lower = name.lower()
-
-            is_qwen = (
-                "qwen" in model_lower
-                or "qwen" in name_lower
-            )
-
-            if not is_qwen:
-                continue
-
-            pricing = model.get(
-                "pricing",
-                {}
-            )
-
-            prompt_price = str(
-                pricing.get(
-                    "prompt",
-                    ""
-                )
-            )
-
-            completion_price = str(
-                pricing.get(
-                    "completion",
-                    ""
-                )
-            )
-
-            if (
-                prompt_price != "0"
-                or completion_price != "0"
-            ):
-                continue
-
-            free_qwen.append(
-                model
-            )
-
-        free_qwen.sort(
-            key=lambda m: (
-                ":free" not in str(
-                    m.get(
-                        "id",
-                        ""
-                    )
-                ).lower(),
-                str(
-                    m.get(
-                        "id",
-                        ""
-                    )
-                )
-            )
-        )
-
-        if free_qwen:
-
-            selected = str(
-                free_qwen[0].get(
-                    "id"
-                )
-            )
-
-            openrouter_model_cache[
-                "model"
-            ] = selected
-
-            openrouter_model_cache[
-                "time"
-            ] = now
-
-            print(
-                "Selected FREE Qwen model:",
-                selected
-            )
-
-            return selected
-
-        print(
-            "No currently available FREE Qwen model found."
-        )
-
-        return None
-
-    except Exception as e:
-
-        print(
-            "OpenRouter model discovery error:",
-            repr(e)
-        )
-
-        return None
-
-
-# ============================================================
-# OPENROUTER TRANSLATION
+# OPENROUTER TRANSLATION (FAST FREE ROTATION)
 # ============================================================
 
 def translate_with_openrouter(
@@ -1484,15 +1310,6 @@ def translate_with_openrouter(
         text
     )
 
-    selected_model = (
-        preferred_model
-        or get_free_qwen_model()
-    )
-
-    if not selected_model:
-
-        selected_model = OPENROUTER_FREE_ROUTER
-
     headers = {
         "Authorization":
             "Bearer "
@@ -1508,22 +1325,24 @@ def translate_with_openrouter(
             "Free Novel Translator"
     }
 
-    payload = {
-        "model": selected_model,
-
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-
-        "temperature": 0.2
-    }
+    models_to_try = FREE_FALLBACK_MODELS.copy()
+    if preferred_model and preferred_model not in models_to_try:
+        models_to_try.insert(0, preferred_model)
 
     last_error = None
 
-    for attempt in range(MAX_RETRIES):
+    for target_model in models_to_try:
+
+        payload = {
+            "model": target_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.2
+        }
 
         try:
 
@@ -1534,147 +1353,46 @@ def translate_with_openrouter(
                 timeout=OPENROUTER_TIMEOUT
             )
 
-            if response.status_code != 200:
+            if response.status_code == 200:
 
-                error_text = response.text
+                data = response.json()
 
-                if (
-                    selected_model
-                    != OPENROUTER_FREE_ROUTER
-                    and response.status_code
-                    in (400, 404, 503)
-                ):
-
-                    print(
-                        "Selected FREE Qwen model unavailable."
-                    )
-
-                    print(
-                        "Switching to OpenRouter FREE router."
-                    )
-
-                    selected_model = (
-                        OPENROUTER_FREE_ROUTER
-                    )
-
-                    payload["model"] = (
-                        selected_model
-                    )
-
-                    response = requests.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers=headers,
-                        json=payload,
-                        timeout=OPENROUTER_TIMEOUT
-                    )
-
-                    if response.status_code != 200:
-
-                        error_text = response.text
-
-                if response.status_code != 200:
-
-                    raise RuntimeError(
-                        "OpenRouter HTTP "
-                        + str(
-                            response.status_code
-                        )
-                        + ": "
-                        + error_text
-                    )
-
-            data = response.json()
-
-            choices = data.get(
-                "choices",
-                []
-            )
-
-            if not choices:
-
-                raise RuntimeError(
-                    "OpenRouter returned no choices."
+                choices = data.get(
+                    "choices",
+                    []
                 )
 
-            message = choices[0].get(
-                "message",
-                {}
-            )
+                if choices:
 
-            translated = message.get(
-                "content"
-            )
+                    translated = (
+                        choices[0]
+                        .get("message", {})
+                        .get("content", "")
+                        .strip()
+                    )
 
-            if not translated:
+                    if translated:
 
-                raise RuntimeError(
-                    "OpenRouter returned no translation text."
-                )
-
-            if isinstance(
-                translated,
-                list
-            ):
-
-                parts = []
-
-                for item in translated:
-
-                    if isinstance(
-                        item,
-                        dict
-                    ):
-
-                        value = item.get(
-                            "text"
+                        actual_model = data.get(
+                            "model",
+                            target_model
                         )
 
-                        if value:
-                            parts.append(
-                                value
-                            )
-
-                translated = "\n".join(
-                    parts
-                )
-
-            translated = str(
-                translated
-            ).strip()
-
-            if not translated:
-
-                raise RuntimeError(
-                    "OpenRouter returned an empty translation."
-                )
-
-            actual_model = data.get(
-                "model",
-                selected_model
-            )
-
-            return (
-                translated,
-                actual_model
-            )
+                        return (
+                            translated,
+                            actual_model
+                        )
 
         except Exception as e:
 
-            last_error = e
-
             print(
-                f"OPENROUTER ERROR (Attempt {attempt + 1}/{MAX_RETRIES}):",
-                repr(e)
+                f"OpenRouter model {target_model} failed or timed out: {e}"
             )
 
-            if attempt < MAX_RETRIES - 1:
-
-                time.sleep(
-                    (2 ** attempt) * 3
-                )
+            last_error = e
 
     raise RuntimeError(
-        "OpenRouter translation failed.\n\n"
+        "All free OpenRouter fallback models are currently busy.\n\n"
         + str(last_error)
     )
 
@@ -1791,7 +1509,7 @@ def translation_worker(job_id):
             ):
 
                 job["status"] = (
-                    "Translating chapter "
+                    "Translating section "
                     + str(index + 1)
                     + "/"
                     + str(total)
@@ -1825,15 +1543,15 @@ def translation_worker(job_id):
                             job["provider_model"] = None
 
                             job["status"] = (
-                                "Gemini server demand spike hit 503 error. "
-                                "Switched to FREE OpenRouter."
+                                "Gemini server demand spike hit limit. "
+                                "Switched to FREE OpenRouter fallback."
                             )
 
                             send_telegram(
                                 "Novel Translator:\n\n"
                                 + job["filename"]
                                 + "\n\n"
-                                "Gemini failed/exhausted. "
+                                "Gemini spike hit limit. "
                                 "Switched to FREE OpenRouter."
                             )
 
@@ -1913,7 +1631,7 @@ def translation_worker(job_id):
             if job["provider"] == "gemini":
 
                 provider_text = (
-                    "Gemini"
+                    "Gemini 2.5 Flash"
                 )
 
             else:
@@ -1930,7 +1648,7 @@ def translation_worker(job_id):
                     )
 
             job["status"] = (
-                "Completed chapter "
+                "Completed section "
                 + str(
                     job[
                         "translated_chapters"
@@ -2479,7 +2197,7 @@ def health():
             GEMINI_MODEL,
 
         "openrouter_mode":
-            "FREE Qwen when available, otherwise openrouter/free"
+            "Multi-model free rotation"
     }
 
 
