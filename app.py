@@ -98,14 +98,12 @@ OPENROUTER_FREE_ROUTER = "openrouter/free"
 
 
 # ============================================================
-# TRANSLATION SETTINGS
+# TRANSLATION SETTINGS (OPTIMIZED FOR SPEED)
 # ============================================================
 
-MAX_CHARS_PER_REQUEST = 6500
+MAX_CHARS_PER_REQUEST = 12000
 
-DOWNLOAD_MIN_WORDS = 30000
-
-REQUEST_DELAY = 3.5
+REQUEST_DELAY = 1.0
 
 MAX_RETRIES = 5
 
@@ -466,9 +464,7 @@ hr {
         </p>
 
         <p>
-            7. Download becomes available after
-            <strong>{{ "{:,}".format(min_words) }}</strong>
-            English words.
+            7. Download becomes available as soon as any text is translated.
         </p>
 
     </div>
@@ -641,7 +637,7 @@ hr {
                 {% endif %}
 
 
-                {% if job.words >= min_words %}
+                {% if job.words > 0 %}
 
                     <div class="download-box">
 
@@ -649,7 +645,7 @@ hr {
                             class="button green"
                             href="/download/{{ job_id }}"
                         >
-                            📥 Download Current EPUB
+                            📥 Download Current EPUB ({{ "{:,}".format(job.words) }} words)
                         </a>
 
                     </div>
@@ -657,31 +653,8 @@ hr {
                 {% else %}
 
                     <div class="small">
-                        🔒 Download unlocks at
-                        <strong>
-                            {{ "{:,}".format(min_words) }}
-                        </strong>
-                        words.
-                        <br><br>
-                        Current:
-                        <strong>
-                            {{ "{:,}".format(job.words) }}
-                        </strong>
-                        words.
+                        🔒 Download unlocks once the first chapter/section finishes translating.
                     </div>
-
-                {% endif %}
-
-
-                {% if job.translated_chapters == job.total_chapters
-                      and not job.error %}
-
-                    <a
-                        class="button green"
-                        href="/download/{{ job_id }}"
-                    >
-                        📚 Download Complete EPUB
-                    </a>
 
                 {% endif %}
 
@@ -747,7 +720,6 @@ def require_login():
         return None
 
     if not is_authenticated():
-        # Prevent redirect loops if already on index with login screen
         if request.endpoint == "index":
             return None
         return redirect(
@@ -764,14 +736,9 @@ def index():
 
     return render_template_string(
         PAGE,
-
         authenticated=authenticated,
-
         login_error=False,
-
-        jobs=jobs,
-
-        min_words=DOWNLOAD_MIN_WORDS
+        jobs=jobs
     )
 
 
@@ -800,8 +767,7 @@ def login():
         PAGE,
         authenticated=False,
         login_error=True,
-        jobs={},
-        min_words=DOWNLOAD_MIN_WORDS
+        jobs={}
     )
 
 
@@ -1013,7 +979,7 @@ def parse_txt(data):
 
         chunks = split_large_text(
             text,
-            max_chars=12000
+            max_chars=MAX_CHARS_PER_REQUEST
         )
 
         for i, chunk in enumerate(chunks):
@@ -1115,7 +1081,7 @@ def parse_epub(data):
 
             parts = split_large_text(
                 text,
-                max_chars=12000
+                max_chars=MAX_CHARS_PER_REQUEST
             )
 
             chapters.extend(
@@ -1318,7 +1284,7 @@ def translate_with_gemini(text):
 
             if attempt < MAX_RETRIES - 1:
                 if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    sleep_time = (2 ** attempt) * 5
+                    sleep_time = (2 ** attempt) * 3
                     print(f"Gemini server load spike (503/429). Retrying in {sleep_time} seconds...")
                     time.sleep(sleep_time)
                 else:
@@ -1704,7 +1670,7 @@ def translate_with_openrouter(
             if attempt < MAX_RETRIES - 1:
 
                 time.sleep(
-                    (2 ** attempt) * 5
+                    (2 ** attempt) * 3
                 )
 
     raise RuntimeError(
@@ -2201,20 +2167,6 @@ def download(job_id):
 
         return (
             "Nothing has been translated yet."
-        )
-
-    if (
-        job["words"] < DOWNLOAD_MIN_WORDS
-        and job["translated_chapters"]
-        < job["total_chapters"]
-    ):
-
-        return (
-            "Download unlocks after "
-            + str(
-                DOWNLOAD_MIN_WORDS
-            )
-            + " English words."
         )
 
     try:
